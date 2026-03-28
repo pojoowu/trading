@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+data/portfolio.json
+data/trades.log
+logs/
+reports/
+*.egg-info/
+.venv/
