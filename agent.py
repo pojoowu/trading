@@ -129,6 +129,68 @@ def _tool_get_portfolio(portfolio: PortfolioManager) -> str:
     })
 
 
+def _tool_intraday_timing(params: dict) -> str:
+    """
+    Check intraday entry timing for a list of tickers using the best
+    backtested intraday strategy (loaded from data/intraday_params.json).
+    Returns per-ticker entry signals + reasoning.
+    """
+    from intraday_data import get_intraday_bars
+    from intraday_strategy import intraday_entry_now
+    from optimizer import load_intraday_params
+
+    tickers     = params.get("tickers", [])
+    intraday_p  = load_intraday_params()
+    strategy    = intraday_p.get("strategy", "vwap_reversion")
+    strat_params = intraday_p.get("params", {})
+
+    results = {}
+    for ticker in tickers:
+        df = get_intraday_bars(ticker, interval="1h", days=5)
+        if df is None or len(df) < 10:
+            results[ticker] = {"enter_now": False, "reason": "no intraday data"}
+            continue
+        signal = intraday_entry_now(df, strategy=strategy, params=strat_params or None)
+        results[ticker] = signal
+
+    return json.dumps({
+        "strategy":      strategy,
+        "strategy_params": strat_params,
+        "signals":       results,
+        "enter_count":   sum(1 for v in results.values() if v.get("enter_now")),
+    })
+
+
+def _tool_backtest_intraday(params: dict) -> str:
+    """
+    Backtest and optimise all three intraday strategies for a ticker,
+    returning the best strategy + parameters + metrics.
+    """
+    from intraday_data import get_intraday_bars
+    from intraday_backtester import compare_strategies, format_intraday_report
+
+    ticker = params.get("ticker", "")
+    df     = get_intraday_bars(ticker, interval="1h", days=730)
+    if df is None or len(df) < 50:
+        return json.dumps({"error": f"insufficient intraday data for {ticker}"})
+
+    result = compare_strategies(ticker, df)
+    report = format_intraday_report(result)
+    return json.dumps({
+        "report":       report,
+        "winner":       result["winner"],
+        "best_params":  result["best_params"],
+        "best_metrics": result["best_metrics"],
+        "ranking":      [{
+            "strategy": r["strategy"],
+            "sharpe":   r["metrics"].get("sharpe"),
+            "win_rate": r["metrics"].get("win_rate_pct"),
+            "trades":   r["metrics"].get("total_trades"),
+            "score":    r["score"],
+        } for r in result["ranking"]],
+    })
+
+
 def _tool_set_allocation(
     params: dict,
     price_data: dict,
@@ -299,6 +361,43 @@ TOOLS = [
             "required": ["tickers"],
         },
     },
+    {
+        "name": "backtest_intraday",
+        "description": (
+            "Backtest and optimise all three intraday strategies (VWAP reversion, "
+            "Opening Range Breakout, Hourly Momentum) on up to 2 years of hourly bars. "
+            "Returns the winning strategy, its best parameters, and full metrics "
+            "(win rate, profit factor, Sharpe, max drawdown). "
+            "Run this on each of your top picks to find the best intraday entry style."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "Ticker symbol"},
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "name": "intraday_timing",
+        "description": (
+            "Check the current intraday entry signal for a list of tickers using the "
+            "best backtested intraday strategy. Returns which stocks have an active "
+            "entry signal RIGHT NOW (based on latest hourly bar). "
+            "Call this just before set_allocation to get the best entry timing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tickers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tickers to check for intraday entry signal",
+                },
+            },
+            "required": ["tickers"],
+        },
+    },
 ]
 
 
@@ -306,22 +405,29 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are an expert quantitative trading agent.
 
-Your mission is to identify the best stocks to invest in TODAY and execute the trades.
+Your mission is to identify the best stocks to invest in TODAY and execute trades at the optimal intraday moment.
 
 You must follow this disciplined process in order:
 1. SCREEN: Call screen_stocks to get the top candidates from the universe.
 2. ALPHA: Call compute_alpha on the screened candidates to rank by multi-factor alpha.
-3. ANALYZE: Call analyze_stock on the top 5 candidates individually for deep technical/fundamental review.
-4. BACKTEST STOCKS: Call backtest_stock on each of your top 3-5 picks to validate historical performance.
-5. BACKTEST PORTFOLIO: Call backtest_portfolio with all finalists to see portfolio-level performance.
-6. PORTFOLIO CHECK: Call get_portfolio to see current holdings and P&L.
-7. DECIDE: Combine all signals (alpha, analysis, backtest) to select the final list (max 10 stocks).
-   - Only invest in stocks that have: positive alpha, BUY/WEAK BUY technical recommendation,
-     acceptable backtest (Sharpe > 0.5, max drawdown < -35%), and strong momentum.
+3. ANALYZE: Call analyze_stock on the top 5 candidates for deep technical/fundamental review.
+4. BACKTEST STOCKS: Call backtest_stock on your top 3-5 picks to validate daily strategy performance.
+5. BACKTEST INTRADAY: Call backtest_intraday on each finalist to find the best intraday entry strategy
+   (VWAP reversion, Opening Range Breakout, or Hourly Momentum) and its optimal parameters.
+6. BACKTEST PORTFOLIO: Call backtest_portfolio with all finalists for portfolio-level performance.
+7. PORTFOLIO CHECK: Call get_portfolio to see current holdings and P&L.
+8. DECIDE: Combine all signals to select the final list (max 10 stocks).
+   - Only invest in stocks with: positive alpha, BUY/WEAK BUY recommendation,
+     acceptable daily backtest (Sharpe > 0.5, max drawdown > -35%),
+     AND a profitable intraday strategy (win rate > 50%, profit factor > 1.2).
    - Avoid overbought stocks (RSI > 75) unless fundamentals are exceptional.
-8. EXECUTE: Call set_allocation with your final ranked list and reasoning.
+9. INTRADAY TIMING: Call intraday_timing on your final list to check if NOW is a good entry point.
+   - If fewer than half the stocks have an active intraday signal, consider waiting or reducing size.
+10. EXECUTE: Call set_allocation with your final ranked list and reasoning.
 
-Be analytical, disciplined, and risk-aware. After execution, summarise your decisions with clear reasoning.
+Be analytical, disciplined, and risk-aware. The intraday timing step is critical —
+entering at the right moment within the day significantly improves average entry price.
+After execution, summarise your decisions with clear reasoning including the intraday strategy used.
 """
 
 
@@ -405,6 +511,12 @@ def run_agent(
 
         elif tool_name == "get_portfolio":
             return _tool_get_portfolio(portfolio)
+
+        elif tool_name == "backtest_intraday":
+            return _tool_backtest_intraday(tool_input)
+
+        elif tool_name == "intraday_timing":
+            return _tool_intraday_timing(tool_input)
 
         elif tool_name == "set_allocation":
             tickers = tool_input.get("tickers", [])

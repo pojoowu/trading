@@ -19,6 +19,7 @@ writes parameters. The daily agent reads those parameters at startup.
 """
 import json
 import logging
+import os
 import random
 import copy
 from datetime import datetime
@@ -392,6 +393,17 @@ def run_optimizer(
         "commentary":       optimizer_commentary.strip(),
     }
 
+    # Also run intraday strategy optimizer
+    try:
+        from config import UNIVERSE_TICKERS
+        intraday_result = run_intraday_optimizer(list(price_data.keys()) or UNIVERSE_TICKERS[:15])
+        result["intraday_update"] = intraday_result
+        logger.info("Intraday params updated: strategy=%s", intraday_result.get("strategy"))
+    except Exception as exc:
+        logger.warning("Intraday optimizer failed (non-fatal): %s", exc)
+
+    return result
+
 
 def _save_optimizer_report(
     date_str, recent_metrics, signal_accuracy,
@@ -419,6 +431,125 @@ def _save_optimizer_report(
         f.write("NEW PARAMETERS\n")
         f.write(json.dumps(new_params, indent=2) + "\n")
     logger.info("Optimizer report saved to %s", path)
+
+
+# ── Intraday strategy optimizer ──────────────────────────────────────────────
+
+INTRADAY_PARAMS_FILE = "data/intraday_params.json"
+
+DEFAULT_INTRADAY_PARAMS = {
+    "strategy":        "vwap_reversion",   # winning strategy name
+    "params":          {},                  # best params for that strategy
+    "version":         1,
+    "updated_at":      "",
+    "update_reason":   "initial defaults",
+}
+
+
+def load_intraday_params() -> dict:
+    if os.path.exists(INTRADAY_PARAMS_FILE):
+        try:
+            with open(INTRADAY_PARAMS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return dict(DEFAULT_INTRADAY_PARAMS)
+
+
+def save_intraday_params(params: dict) -> None:
+    os.makedirs("data", exist_ok=True)
+    params["updated_at"] = datetime.utcnow().isoformat()
+    with open(INTRADAY_PARAMS_FILE, "w") as f:
+        json.dump(params, f, indent=2)
+    logger.info("Intraday params saved (v%s  strategy=%s)", params.get("version"), params.get("strategy"))
+
+
+def run_intraday_optimizer(tickers: list[str]) -> dict:
+    """
+    Fetch hourly data for each ticker, run compare_strategies() to find the
+    best intraday strategy + parameters, then save to data/intraday_params.json.
+
+    Aggregates results across all tickers and picks the strategy that wins most.
+    """
+    from intraday_data import batch_intraday
+    from intraday_backtester import compare_strategies, format_intraday_report
+
+    logger.info("Running intraday optimizer on %d tickers…", len(tickers))
+
+    hourly_data = batch_intraday(tickers[:15], interval="1h", days=730)
+    if not hourly_data:
+        return {"error": "no intraday data"}
+
+    strategy_wins   = {}
+    strategy_scores = {}
+    best_per_ticker = {}
+
+    for ticker, df in hourly_data.items():
+        try:
+            result = compare_strategies(ticker, df)
+            winner = result["winner"]
+            score  = result["best_metrics"].get("sharpe", 0) or 0
+
+            strategy_wins[winner]   = strategy_wins.get(winner, 0) + 1
+            strategy_scores[winner] = strategy_scores.get(winner, 0) + score
+            best_per_ticker[ticker] = result
+
+            logger.info(
+                "  %s → best=%s  sharpe=%.2f  win_rate=%.1f%%  trades=%d",
+                ticker, winner, score,
+                result["best_metrics"].get("win_rate_pct", 0),
+                result["best_metrics"].get("total_trades", 0),
+            )
+        except Exception as exc:
+            logger.warning("Intraday optimize failed for %s: %s", ticker, exc)
+
+    if not strategy_wins:
+        return {"error": "no results"}
+
+    # Pick overall winner: most wins, then highest total Sharpe
+    overall_winner = max(
+        strategy_wins,
+        key=lambda s: (strategy_wins[s], strategy_scores.get(s, 0)),
+    )
+
+    # Aggregate best params for the winning strategy across all tickers
+    # (use median values to avoid overfitting to a single stock)
+    winning_params_list = [
+        best_per_ticker[t]["best_params"]
+        for t in best_per_ticker
+        if best_per_ticker[t]["winner"] == overall_winner
+        and best_per_ticker[t].get("best_params")
+    ]
+
+    aggregated_params = {}
+    if winning_params_list:
+        all_keys = set(k for p in winning_params_list for k in p)
+        for key in all_keys:
+            vals = [p[key] for p in winning_params_list if key in p]
+            try:
+                aggregated_params[key] = float(np.median([float(v) for v in vals]))
+            except Exception:
+                aggregated_params[key] = vals[0]
+
+    current = load_intraday_params()
+    new_intraday = {
+        "strategy":      overall_winner,
+        "params":        aggregated_params,
+        "version":       current.get("version", 1) + 1,
+        "update_reason": (
+            f"Strategy wins: {strategy_wins}. "
+            f"{overall_winner} won on {strategy_wins.get(overall_winner, 0)}/{len(hourly_data)} tickers."
+        ),
+        "strategy_wins":  strategy_wins,
+        "strategy_scores": {k: round(v, 3) for k, v in strategy_scores.items()},
+    }
+    save_intraday_params(new_intraday)
+
+    logger.info(
+        "Intraday optimizer complete. Winner: %s  (wins=%d/%d)",
+        overall_winner, strategy_wins.get(overall_winner, 0), len(hourly_data),
+    )
+    return new_intraday
 
 
 # ── Convenience: fill in forward returns for past signal logs ─────────────────
