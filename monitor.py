@@ -7,6 +7,8 @@ Run any time to see current status:
     python monitor.py --trades   # show full trade history
     python monitor.py --report   # print latest daily report
     python monitor.py --params   # show current strategy parameters
+    python monitor.py --compare  # before/after improvement per optimizer version
+    python monitor.py --signals  # which signals are most predictive over time
 """
 import argparse
 import json
@@ -308,6 +310,216 @@ def dashboard():
     show_params()
 
 
+# ── Version comparison (before/after each optimizer run) ─────────────────────
+
+def show_comparison():
+    """
+    Split performance history by strategy params version and show
+    key metrics (CAGR, Sharpe, win rate, drawdown) for each version
+    so you can see whether the optimizer actually improved things.
+    """
+    history = _load_history(180)
+    if len(history) < 5:
+        print(_yellow("  Not enough history yet (need 5+ days). Run the agent for a few weeks first."))
+        return
+
+    import numpy as np
+
+    # Group records by params_version
+    versions = {}
+    for r in history:
+        v = r.get("params_version", 1)
+        versions.setdefault(v, []).append(r)
+
+    print(_bold("─" * 72))
+    print(_bold("  PERFORMANCE BY STRATEGY VERSION  (did the optimizer help?)"))
+    print(_bold("─" * 72))
+    print(f"  {'Ver':<5} {'Period':<24} {'Days':<6} {'Return':>8} "
+          f"{'CAGR':>7} {'Sharpe':>8} {'MaxDD':>8} {'Reason'}")
+    print("  " + "─" * 70)
+
+    prev_equity = None
+    for ver in sorted(versions.keys()):
+        records  = versions[ver]
+        equities = [r["portfolio_equity"] for r in records if "portfolio_equity" in r]
+        if len(equities) < 2:
+            continue
+
+        start_date = records[0].get("date", "?")
+        end_date   = records[-1].get("date", "?")
+        n_days     = len(equities)
+
+        total_ret = equities[-1] / equities[0] - 1
+        n_years   = n_days / 252
+        cagr      = (1 + total_ret) ** (1 / max(n_years, 0.01)) - 1
+        rets      = [equities[i] / equities[i-1] - 1 for i in range(1, len(equities))]
+        sharpe    = (sum(rets) / len(rets)) / (max((sum(r**2 for r in rets)/len(rets))**0.5, 1e-9)) * (252**0.5)
+        peak      = equities[0]
+        max_dd    = 0.0
+        for v in equities:
+            peak   = max(peak, v)
+            max_dd = min(max_dd, (v - peak) / peak)
+
+        ret_str = _green(f"{total_ret*100:+.1f}%") if total_ret >= 0 else _red(f"{total_ret*100:+.1f}%")
+        cagr_str = _green(f"{cagr*100:+.1f}%") if cagr >= 0 else _red(f"{cagr*100:+.1f}%")
+        sh_str   = _green(f"{sharpe:.2f}") if sharpe >= 0.5 else (_yellow(f"{sharpe:.2f}") if sharpe >= 0 else _red(f"{sharpe:.2f}"))
+        dd_str   = _red(f"{max_dd*100:.1f}%")
+
+        # Show improvement arrow vs previous version
+        arrow = ""
+        if prev_equity is not None:
+            prev_cagr = prev_equity
+            arrow = _green(" ▲ improved") if cagr > prev_cagr else _red(" ▼ declined")
+        prev_equity = cagr
+
+        # Get update reason from params history
+        params = _load_json("data/strategy_params.json") or {}
+        reason = ""
+        if params.get("version") == ver:
+            reason = (params.get("update_reason") or "")[:35]
+
+        print(f"  v{ver:<4} {start_date} → {end_date}  {n_days:<6} {ret_str:>16} "
+              f"{cagr_str:>15} {sh_str:>16} {dd_str:>16}  {_cyan(reason)}{arrow}")
+
+    print()
+
+    # Summary: best version
+    best_ver = None
+    best_sharpe = -999
+    for ver, records in versions.items():
+        equities = [r["portfolio_equity"] for r in records if "portfolio_equity" in r]
+        if len(equities) < 2:
+            continue
+        rets   = [equities[i] / equities[i-1] - 1 for i in range(1, len(equities))]
+        std    = max((sum(r**2 for r in rets)/len(rets))**0.5, 1e-9)
+        sharpe = (sum(rets)/len(rets)) / std * (252**0.5)
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_ver    = ver
+
+    if best_ver:
+        print(f"  {_bold('Best version so far:')} v{best_ver}  (Sharpe {best_sharpe:.2f})")
+    print(_bold("─" * 72))
+    print()
+
+    # Show what changed between versions
+    opt_reports = sorted(Path("reports").glob("optimizer_*.txt")) if Path("reports").exists() else []
+    if opt_reports:
+        print(_bold("  OPTIMIZER CHANGE LOG"))
+        print("  " + "─" * 50)
+        for rpt in opt_reports[-5:]:
+            lines = rpt.read_text().splitlines()
+            date  = rpt.stem.replace("optimizer_", "")
+            # Extract update reason line
+            for i, line in enumerate(lines):
+                if "UPDATE REASON" in line and i + 1 < len(lines):
+                    reason = lines[i + 1].strip()[:70]
+                    print(f"  {_cyan(date)}  {reason}")
+                    break
+        print()
+
+
+# ── Signal accuracy over time ─────────────────────────────────────────────────
+
+def show_signals():
+    """
+    Show which alpha signals have been most predictive of actual returns,
+    and how their accuracy has changed over time (improving = optimizer is learning).
+    """
+    signal_log = _load_jsonl("data/signal_log.jsonl", 1000)
+    resolved   = [r for r in signal_log if r.get("forward_return_1m") is not None]
+
+    print(_bold("─" * 65))
+    print(_bold("  SIGNAL ACCURACY  (correlation with actual 1-month returns)"))
+    print(_bold("─" * 65))
+
+    if len(resolved) < 10:
+        print(_yellow(f"  Only {len(resolved)} resolved signals so far."))
+        print(_yellow("  Need ~21 trading days before forward returns are filled in."))
+        print(_yellow("  Check back after the first optimizer run (Sunday 18:00 UTC)."))
+        print()
+        # Still show what signals exist
+        if signal_log:
+            print(f"  {len(signal_log)} signals logged, {len(resolved)} resolved so far.")
+            earliest = signal_log[0].get("signal_date", "?")
+            latest   = signal_log[-1].get("signal_date", "?")
+            print(f"  Date range: {earliest} → {latest}")
+        return
+
+    import numpy as np
+
+    signal_names = [
+        "cross_momentum", "sharpe_momentum", "trend_following",
+        "analyst_upside", "value_quality", "volume_surge", "short_reversal",
+    ]
+
+    # Load current weights for comparison
+    params  = _load_json("data/strategy_params.json") or {}
+    weights = params.get("signal_weights", {})
+
+    print(f"  {'Signal':<22} {'Corr':>6}  {'Weight':>7}  {'Bar':<30}  Verdict")
+    print("  " + "─" * 75)
+
+    correlations = {}
+    for sig in signal_names:
+        xs, ys = [], []
+        for r in resolved:
+            val = r.get("signals", {}).get(sig)
+            ret = r.get("forward_return_1m")
+            if val is not None and ret is not None:
+                xs.append(float(val))
+                ys.append(float(ret))
+        if len(xs) >= 5:
+            corr = float(np.corrcoef(xs, ys)[0, 1])
+            correlations[sig] = corr
+
+    # Sort by absolute correlation
+    sorted_sigs = sorted(correlations.items(), key=lambda x: abs(x[1]), reverse=True)
+
+    for sig, corr in sorted_sigs:
+        weight  = weights.get(sig, 0.0)
+        bar_len = int(abs(corr) * 25)
+        bar_chr = "█" if corr >= 0 else "░"
+        bar     = bar_chr * bar_len
+
+        if corr >= 0.15:
+            verdict = _green("predictive ✓")
+            bar_col = _green(bar)
+        elif corr >= 0.05:
+            verdict = _yellow("weak signal")
+            bar_col = _yellow(bar)
+        elif corr >= -0.05:
+            verdict = "  noise    "
+            bar_col = bar
+        else:
+            verdict = _red("inverse    ")
+            bar_col = _red(bar)
+
+        w_str = f"{weight:.3f}" if weight else "default"
+        print(f"  {sig:<22} {corr:>+6.3f}  {w_str:>7}  {bar_col:<40}  {verdict}")
+
+    print()
+    print(f"  Based on {len(resolved)} resolved signals  ({len(signal_log) - len(resolved)} pending forward returns)")
+    print()
+
+    # Show if optimizer has been adjusting weights in the right direction
+    if weights and correlations:
+        aligned = sum(
+            1 for sig, corr in correlations.items()
+            if weights.get(sig, 0) > 0.10 and corr > 0.05   # high weight + predictive
+            or weights.get(sig, 0) < 0.10 and corr < 0.05   # low weight + weak
+        )
+        total = len(correlations)
+        pct   = aligned / total * 100
+        msg   = (
+            _green(f"  Optimizer weights are aligned with signal accuracy ({aligned}/{total} correct direction)")
+            if pct >= 60 else
+            _yellow(f"  Optimizer still learning ({aligned}/{total} weights aligned with accuracy)")
+        )
+        print(msg)
+    print(_bold("─" * 65))
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -317,6 +529,8 @@ def main():
     parser.add_argument("--report",    action="store_true", help="Print latest daily report")
     parser.add_argument("--params",    action="store_true", help="Show strategy parameters")
     parser.add_argument("--optimizer", action="store_true", help="Show latest optimizer run")
+    parser.add_argument("--compare",   action="store_true", help="Before/after improvement per optimizer version")
+    parser.add_argument("--signals",   action="store_true", help="Signal accuracy vs actual returns")
     parser.add_argument("--interval",  type=int, default=60, help="Watch refresh seconds")
     args = parser.parse_args()
 
@@ -336,6 +550,14 @@ def main():
     if args.optimizer:
         os.system("")
         show_optimizer_history()
+        return
+    if args.compare:
+        os.system("")
+        show_comparison()
+        return
+    if args.signals:
+        os.system("")
+        show_signals()
         return
 
     # Dashboard (with optional watch loop)
