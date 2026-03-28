@@ -32,6 +32,11 @@ from analyzer import analyze_stock, format_analysis_report
 from backtester import backtest_single, backtest_portfolio, format_backtest_report
 from portfolio import PortfolioManager, compute_target_allocation
 from executor import Executor
+from performance_tracker import (
+    load_params,
+    record_daily_run,
+    record_signal_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +369,7 @@ def run_agent(
 
     def _dispatch(tool_name: str, tool_input: dict) -> str:
         """Dispatch a tool call and return the result as a string."""
+        nonlocal agent_picks, last_alpha_scores
         logger.info("Tool call: %s  input=%s", tool_name, str(tool_input)[:200])
 
         if tool_name == "screen_stocks":
@@ -401,11 +407,24 @@ def run_agent(
             return _tool_get_portfolio(portfolio)
 
         elif tool_name == "set_allocation":
-            if dry_run:
-                return json.dumps({"note": "DRY RUN: allocation not executed", "tickers": tool_input.get("tickers", [])})
             tickers = tool_input.get("tickers", [])
+            nonlocal agent_picks
+            agent_picks = tickers
+            if dry_run:
+                return json.dumps({"note": "DRY RUN: allocation not executed", "tickers": tickers})
             _ensure_data(tickers)
             return _tool_set_allocation(tool_input, price_data, portfolio, executor)
+
+        elif tool_name == "compute_alpha":
+            result = _tool_compute_alpha(tool_input, price_data, fundamentals_data)
+            # Cache alpha scores for performance tracking
+            try:
+                scores = json.loads(result).get("alpha_scores", [])
+                for row in scores:
+                    last_alpha_scores[row["ticker"]] = row
+            except Exception:
+                pass
+            return result
 
         else:
             return json.dumps({"error": f"unknown tool: {tool_name}"})
@@ -423,8 +442,16 @@ def run_agent(
         }
     ]
 
+    # Load live strategy parameters (updated by optimizer)
+    strategy_params = load_params()
+    logger.info("Using strategy params version %d: %s",
+                strategy_params.get("version", 1),
+                strategy_params.get("update_reason", "defaults"))
+
     final_text = ""
     max_turns  = 30
+    agent_picks: list[str] = []
+    last_alpha_scores: dict = {}
 
     for turn in range(max_turns):
         response = client.messages.create(
@@ -464,6 +491,40 @@ def run_agent(
         # Append assistant turn + tool results
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
+
+    # ── Record performance + signal outcomes ──────────────────────────────────
+    try:
+        state = portfolio.state
+        positions_snapshot = {
+            t: {
+                "shares":     p.shares,
+                "avg_cost":   p.avg_cost,
+                "last_price": p.last_price,
+                "pnl_pct":    p.unrealised_pnl_pct,
+            }
+            for t, p in state.positions.items()
+        }
+        record_daily_run(
+            date_str=datetime.utcnow().strftime("%Y-%m-%d"),
+            portfolio_equity=state.total_equity,
+            cash=state.cash,
+            positions=positions_snapshot,
+            trades_executed=[],   # executor logs trades separately
+            agent_picks=agent_picks,
+            signal_scores=last_alpha_scores,
+            params_version=strategy_params.get("version", 1),
+        )
+
+        # Record signal outcomes (forward returns filled in later by optimizer)
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        for ticker, scores in last_alpha_scores.items():
+            record_signal_outcome(
+                ticker=ticker,
+                signal_date=date_str,
+                signals={k: v for k, v in scores.items() if k != "ticker"},
+            )
+    except Exception as exc:
+        logger.warning("Performance recording failed: %s", exc)
 
     return final_text.strip()
 
