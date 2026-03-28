@@ -18,14 +18,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_YF_CHART  = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-_HEADERS   = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0 Safari/537.36"
-    )
-}
+_YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
 # Max lookback per interval (Yahoo Finance limits)
 MAX_DAYS = {"1m": 7, "2m": 60, "5m": 60, "15m": 60, "30m": 60, "1h": 730}
@@ -65,53 +58,39 @@ def get_intraday_bars(
         "interval": interval,
     }
 
-    for attempt in range(3):
-        try:
-            r = requests.get(
-                _YF_CHART.format(ticker=ticker),
-                params=params,
-                headers=_HEADERS,
-                timeout=20,
-            )
-            r.raise_for_status()
-            data   = r.json()
-            result = data["chart"]["result"][0]
+    try:
+        from data_fetcher import _get
+        data   = _get(_YF_CHART.format(ticker=ticker), params)
+        result = data["chart"]["result"][0]
 
-            timestamps = result["timestamp"]
-            ohlcv      = result["indicators"]["quote"][0]
+        timestamps = result["timestamp"]
+        ohlcv      = result["indicators"]["quote"][0]
 
-            df = pd.DataFrame(
-                {
-                    "Open":   ohlcv["open"],
-                    "High":   ohlcv["high"],
-                    "Low":    ohlcv["low"],
-                    "Close":  ohlcv["close"],
-                    "Volume": ohlcv["volume"],
-                },
-                index=pd.to_datetime(timestamps, unit="s", utc=True)
-                        .tz_convert("US/Eastern"),
-            )
-            df.index.name = "Datetime"
-            df = df.dropna(subset=["Close"])
-            df = df[df["Volume"] > 0]
-            logger.debug(
-                "Fetched %d %s bars for %s (%s → %s)",
-                len(df), interval, ticker,
-                df.index[0].strftime("%Y-%m-%d") if len(df) else "?",
-                df.index[-1].strftime("%Y-%m-%d") if len(df) else "?",
-            )
-            return df
+        df = pd.DataFrame(
+            {
+                "Open":   ohlcv["open"],
+                "High":   ohlcv["high"],
+                "Low":    ohlcv["low"],
+                "Close":  ohlcv["close"],
+                "Volume": ohlcv["volume"],
+            },
+            index=pd.to_datetime(timestamps, unit="s", utc=True)
+                    .tz_convert("US/Eastern"),
+        )
+        df.index.name = "Datetime"
+        df = df.dropna(subset=["Close"])
+        df = df[df["Volume"] > 0]
+        logger.debug(
+            "Fetched %d %s bars for %s (%s → %s)",
+            len(df), interval, ticker,
+            df.index[0].strftime("%Y-%m-%d") if len(df) else "?",
+            df.index[-1].strftime("%Y-%m-%d") if len(df) else "?",
+        )
+        return df
 
-        except Exception as exc:
-            wait = 2 ** attempt
-            logger.warning(
-                "Intraday fetch attempt %d failed for %s (%s): %s. Retrying in %ds",
-                attempt + 1, ticker, interval, exc, wait,
-            )
-            time.sleep(wait)
-
-    logger.error("Failed to fetch intraday bars for %s (%s)", ticker, interval)
-    return None
+    except Exception as exc:
+        logger.error("Failed to fetch intraday bars for %s (%s): %s", ticker, interval, exc)
+        return None
 
 
 def batch_intraday(
