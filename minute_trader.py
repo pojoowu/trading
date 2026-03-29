@@ -76,6 +76,11 @@ DEFAULT_TRADER_PARAMS = {
     "regime_ema_bars":     20,         # EMA period for regime detection
     "regime_threshold":    -0.005,     # if BTC is this % below its EMA → bear regime
     "regime_size_penalty": 0.5,        # multiply position size by this in bear regime
+    # ── Short selling ────────────────────────────────────────────────────────
+    "short_enabled":       False,      # enable short positions (disabled by default)
+    "short_entry_threshold": 0.05,     # open short when score < -this value
+    "short_exit_threshold":  0.02,     # close short when score rises above this
+    "max_short_positions": 3,          # max concurrent shorts (separate from longs)
     # ── Risk circuit breakers ─────────────────────────────────────────────────
     "max_daily_loss_pct":  0.05,       # pause new entries if daily equity drops 5%
     # ── Optimizer IC settings (read by crypto_optimizer) ─────────────────────
@@ -125,8 +130,9 @@ class CryptoPosition:
     stop_price:      float
     target_price:    float
     last_price:      float = 0.0
-    peak_price:      float = 0.0    # highest price seen since entry (trailing stop)
+    peak_price:      float = 0.0    # longs: highest price; shorts: lowest price (trough)
     partial_tp_done: bool  = False  # True after first partial take-profit fired
+    side:            str   = "long" # "long" or "short"
 
     @property
     def cost_basis(self) -> float:
@@ -134,12 +140,20 @@ class CryptoPosition:
 
     @property
     def market_value(self) -> float:
-        return self.qty * (self.last_price or self.entry_price)
+        p = self.last_price or self.entry_price
+        if self.side == "short":
+            # Short: value rises when price falls
+            # market_value = cost_basis + pnl = qty*(2*entry - current)
+            return self.qty * (2 * self.entry_price - p)
+        return self.qty * p
 
     @property
     def unrealised_pnl_pct(self) -> float:
         if self.entry_price == 0: return 0.0
-        return (self.last_price / self.entry_price - 1) * 100
+        p = self.last_price or self.entry_price
+        if self.side == "short":
+            return (self.entry_price / p - 1) * 100 if p > 0 else 0.0
+        return (p / self.entry_price - 1) * 100
 
     @property
     def hold_minutes(self) -> float:
@@ -184,9 +198,14 @@ class CryptoPortfolio:
     def update_prices(self, prices: dict[str, float]):
         for sym, pos in self.positions.items():
             if sym in prices:
-                pos.last_price = prices[sym]
-                if prices[sym] > pos.peak_price:
-                    pos.peak_price = prices[sym]
+                p = prices[sym]
+                pos.last_price = p
+                if pos.side == "long":
+                    if p > pos.peak_price:
+                        pos.peak_price = p
+                else:  # short: track trough (lowest price = best outcome)
+                    if pos.peak_price == 0 or p < pos.peak_price:
+                        pos.peak_price = p
 
     def open_position(
         self,
@@ -196,6 +215,7 @@ class CryptoPortfolio:
         params:        dict,
         df:            "Optional[pd.DataFrame]" = None,
         regime_factor: float = 1.0,
+        side:          str   = "long",
     ) -> Optional[CryptoPosition]:
         if symbol in self.positions:
             return None
@@ -252,14 +272,23 @@ class CryptoPortfolio:
             symbol, score, score_factor, vol_factor, regime_factor, final_pct * 100, invest,
         )
 
-        # Apply slippage (buy at ask = close + slippage) and fee
-        slippage   = params.get("slippage_pct", 0.0005)
-        fee_pct    = params.get("fee_pct", 0.001)
-        fill_price = price * (1 + slippage)          # paid slightly more than close
-        fee        = invest * fee_pct                 # broker commission
-        qty        = (invest - fee) / fill_price      # net shares after fee
-        stop       = fill_price * (1 - params["stop_loss_pct"])
-        tgt        = fill_price * (1 + params["take_profit_pct"])
+        # Apply slippage and fee; direction differs for long vs short
+        slippage = params.get("slippage_pct", 0.0005)
+        fee_pct  = params.get("fee_pct", 0.001)
+
+        if side == "long":
+            fill_price = price * (1 + slippage)      # buy at ask (slightly above close)
+            stop       = fill_price * (1 - params["stop_loss_pct"])
+            tgt        = fill_price * (1 + params["take_profit_pct"])
+            action     = "BUY"
+        else:  # short
+            fill_price = price * (1 - slippage)      # sell at bid (slightly below close)
+            stop       = fill_price * (1 + params["stop_loss_pct"])   # stop ABOVE entry
+            tgt        = fill_price * (1 - params["take_profit_pct"]) # target BELOW entry
+            action     = "SHORT"
+
+        fee = invest * fee_pct
+        qty = (invest - fee) / fill_price
 
         pos = CryptoPosition(
             symbol=symbol,
@@ -271,13 +300,14 @@ class CryptoPortfolio:
             target_price=tgt,
             last_price=fill_price,
             peak_price=fill_price,
+            side=side,
         )
-        self.cash -= invest   # invest includes fee (qty was net of fee)
+        self.cash -= invest
         self.positions[symbol] = pos
-        _log_trade("BUY", symbol, qty, fill_price, score, invest, fee=fee)
+        _log_trade(action, symbol, qty, fill_price, score, invest, fee=fee)
         logger.info(
-            "OPEN  %-12s qty=%.6f  @ $%.4f  (slip+fee=$%.2f)  score=%.3f",
-            symbol, qty, fill_price, fee + invest * slippage, score,
+            "%s  %-12s qty=%.6f  @ $%.4f  (slip+fee=$%.2f)  score=%.3f",
+            action, symbol, qty, fill_price, fee + invest * slippage, score,
         )
         return pos
 
@@ -286,21 +316,34 @@ class CryptoPortfolio:
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
-        # Apply slippage (sell at bid = close - slippage) and fee
-        slippage   = (params or {}).get("slippage_pct", 0.0005)
-        fee_pct    = (params or {}).get("fee_pct", 0.001)
-        fill_price = price * (1 - slippage)
-        gross      = pos.qty * fill_price
-        fee        = gross * fee_pct
-        proceeds   = gross - fee
-        pnl        = proceeds - pos.cost_basis
-        pnl_pct    = (fill_price / pos.entry_price - 1) * 100 if pos.entry_price else 0
-        self.cash += proceeds
-        _log_trade("SELL", symbol, pos.qty, fill_price, pos.entry_score,
-                   proceeds, pnl=pnl, pnl_pct=pnl_pct, reason=reason, fee=fee)
+        slippage = (params or {}).get("slippage_pct", 0.0005)
+        fee_pct  = (params or {}).get("fee_pct", 0.001)
+
+        if pos.side == "long":
+            fill_price = price * (1 - slippage)       # sell at bid
+            gross      = pos.qty * fill_price
+            fee        = gross * fee_pct
+            proceeds   = gross - fee
+            pnl        = proceeds - pos.cost_basis
+            pnl_pct    = (fill_price / pos.entry_price - 1) * 100 if pos.entry_price else 0
+            self.cash += proceeds
+            action = "SELL"
+        else:  # short: buy back to cover
+            fill_price    = price * (1 + slippage)    # buy back at ask
+            buy_back      = pos.qty * fill_price
+            fee           = buy_back * fee_pct
+            # equity accounting: market_value was qty*(2*entry-current); cash restores that
+            proceeds      = pos.qty * (2 * pos.entry_price - fill_price) - fee
+            pnl           = proceeds - pos.cost_basis
+            pnl_pct       = (pos.entry_price / fill_price - 1) * 100 if fill_price else 0
+            self.cash    += proceeds
+            action = "COVER"
+
+        _log_trade(action, symbol, pos.qty, fill_price, pos.entry_score,
+                   abs(proceeds), pnl=pnl, pnl_pct=pnl_pct, reason=reason, fee=fee)
         logger.info(
-            "CLOSE %-12s @ $%.4f  pnl=%+.2f%%  reason=%s  hold=%.0fmin",
-            symbol, fill_price, pnl_pct, reason, pos.hold_minutes,
+            "CLOSE %-12s %-6s @ $%.4f  pnl=%+.2f%%  reason=%s  hold=%.0fmin",
+            symbol, action, fill_price, pnl_pct, reason, pos.hold_minutes,
         )
 
 
@@ -510,48 +553,79 @@ def run_forever(
                 current_score = next(
                     (s for s2, s, _ in ranked if s2 == sym), 0.0
                 )
+                is_short = pos.side == "short"
 
-                # 6a. Partial take-profit: sell a fraction at partial_tp_pct,
-                #     then slide stop to breakeven so the remainder rides for free
+                # 6a. Partial take-profit
                 partial_tp_pct = params.get("partial_tp_pct", 0.0)
                 if partial_tp_pct > 0 and not pos.partial_tp_done and not dry_run:
-                    if price >= pos.entry_price * (1 + partial_tp_pct):
-                        slippage   = params.get("slippage_pct", 0.0005)
-                        fee_pct    = params.get("fee_pct", 0.001)
-                        fill_p     = price * (1 - slippage)
-                        sell_qty   = pos.qty * params.get("partial_tp_size", 0.5)
-                        gross      = sell_qty * fill_p
-                        fee        = gross * fee_pct
-                        proceeds   = gross - fee
-                        pnl        = proceeds - sell_qty * pos.entry_price
-                        pos.qty   -= sell_qty
+                    slippage = params.get("slippage_pct", 0.0005)
+                    fee_pct  = params.get("fee_pct", 0.001)
+                    if is_short:
+                        triggered = price <= pos.entry_price * (1 - partial_tp_pct)
+                        fill_p    = price * (1 + slippage)   # buy back at ask
+                        sell_qty  = pos.qty * params.get("partial_tp_size", 0.5)
+                        buy_back  = sell_qty * fill_p
+                        fee       = buy_back * fee_pct
+                        proceeds  = sell_qty * (2 * pos.entry_price - fill_p) - fee
+                        pnl       = proceeds - sell_qty * pos.entry_price
+                        pnl_pct   = (pos.entry_price / fill_p - 1) * 100
+                        action    = "COVER_PARTIAL"
+                        new_stop  = pos.entry_price  # move stop to breakeven
+                    else:
+                        triggered = price >= pos.entry_price * (1 + partial_tp_pct)
+                        fill_p    = price * (1 - slippage)
+                        sell_qty  = pos.qty * params.get("partial_tp_size", 0.5)
+                        gross     = sell_qty * fill_p
+                        fee       = gross * fee_pct
+                        proceeds  = gross - fee
+                        pnl       = proceeds - sell_qty * pos.entry_price
+                        pnl_pct   = (fill_p / pos.entry_price - 1) * 100
+                        action    = "SELL_PARTIAL"
+                        new_stop  = pos.entry_price
+
+                    if triggered:
+                        pos.qty             -= sell_qty
                         portfolio.cash      += proceeds
                         pos.partial_tp_done  = True
-                        pos.stop_price       = pos.entry_price   # move stop to breakeven
-                        _log_trade("SELL_PARTIAL", sym, sell_qty, fill_p, pos.entry_score,
-                                   proceeds, pnl=pnl,
-                                   pnl_pct=(fill_p / pos.entry_price - 1) * 100,
+                        pos.stop_price       = new_stop
+                        _log_trade(action, sym, sell_qty, fill_p, pos.entry_score,
+                                   abs(proceeds), pnl=pnl, pnl_pct=pnl_pct,
                                    reason="partial_tp", fee=fee)
                         logger.info(
-                            "PARTIAL_TP %-10s qty=%.6f @ $%.4f  stop->breakeven",
-                            sym, sell_qty, fill_p,
+                            "PARTIAL_TP %-10s %-13s qty=%.6f @ $%.4f  stop->breakeven",
+                            sym, action, sell_qty, fill_p,
                         )
 
-                # 6b. Full exit conditions (checked in priority order)
-                reason = None
+                # 6b. Full exit conditions (inverted for shorts)
+                reason            = None
                 trailing_stop_pct = params.get("trailing_stop_pct", 0.0)
-                if trailing_stop_pct > 0 and pos.peak_price > 0:
-                    trail_level = pos.peak_price * (1 - trailing_stop_pct)
-                    if price <= trail_level:
-                        reason = "trailing_stop"
-                if reason is None and price <= pos.stop_price:
-                    reason = "stop_loss"
-                elif reason is None and price >= pos.target_price:
-                    reason = "take_profit"
-                elif reason is None and pos.hold_minutes >= params["max_hold_minutes"]:
-                    reason = "max_hold"
-                elif reason is None and current_score < params["exit_threshold"]:
-                    reason = "signal_exit"
+
+                if is_short:
+                    if trailing_stop_pct > 0 and pos.peak_price > 0:
+                        # For shorts peak_price = trough; stop if price rose back up
+                        if price >= pos.peak_price * (1 + trailing_stop_pct):
+                            reason = "trailing_stop"
+                    if reason is None and price >= pos.stop_price:
+                        reason = "stop_loss"
+                    elif reason is None and price <= pos.target_price:
+                        reason = "take_profit"
+                    elif reason is None and pos.hold_minutes >= params["max_hold_minutes"]:
+                        reason = "max_hold"
+                    elif reason is None and current_score > params.get("short_exit_threshold",
+                                                                        params["entry_threshold"]):
+                        reason = "signal_exit"
+                else:
+                    if trailing_stop_pct > 0 and pos.peak_price > 0:
+                        if price <= pos.peak_price * (1 - trailing_stop_pct):
+                            reason = "trailing_stop"
+                    if reason is None and price <= pos.stop_price:
+                        reason = "stop_loss"
+                    elif reason is None and price >= pos.target_price:
+                        reason = "take_profit"
+                    elif reason is None and pos.hold_minutes >= params["max_hold_minutes"]:
+                        reason = "max_hold"
+                    elif reason is None and current_score < params["exit_threshold"]:
+                        reason = "signal_exit"
 
                 if reason and not dry_run:
                     portfolio.close_position(sym, price, reason, params=params)
@@ -614,12 +688,60 @@ def run_forever(
                         sym, price, score, params,
                         df=bars.get(sym),
                         regime_factor=regime_factor,
+                        side="long",
                     )
                     if pos:
                         n_open += 1
                         above_thresh_ticks.pop(sym, None)   # reset counter after entry
                 else:
                     logger.info("[DRY] Would BUY %-12s score=%.3f  @ $%.4f", sym, score, price)
+
+            # ── 8b. Enter short positions ───────────────────────────────────
+            if params.get("short_enabled", False) and can_enter:
+                short_entry_thr = params.get("short_entry_threshold",
+                                             params["entry_threshold"])
+                max_shorts      = params.get("max_short_positions", 3)
+                n_shorts        = sum(1 for p in portfolio.positions.values()
+                                     if p.side == "short")
+
+                for sym, score, sigs in reversed(ranked):  # most negative first
+                    if n_open >= params["max_positions"]:
+                        break
+                    if n_shorts >= max_shorts:
+                        break
+                    if sym in portfolio.positions:
+                        continue
+                    if score > -short_entry_thr:
+                        break  # reversed list — all remaining are less negative
+
+                    short_key = f"short_{sym}"
+                    above_thresh_ticks[short_key] = above_thresh_ticks.get(short_key, 0) + 1
+                    if above_thresh_ticks[short_key] < confirm_ticks:
+                        continue
+
+                    if cooldown_m > 0 and sym in last_exit_times:
+                        elapsed_m = (datetime.now(timezone.utc) - last_exit_times[sym]).total_seconds() / 60
+                        if elapsed_m < cooldown_m:
+                            continue
+
+                    price = prices.get(sym, 0)
+                    if price <= 0:
+                        continue
+
+                    if not dry_run:
+                        pos = portfolio.open_position(
+                            sym, price, abs(score), params,
+                            df=bars.get(sym),
+                            regime_factor=regime_factor,
+                            side="short",
+                        )
+                        if pos:
+                            n_open   += 1
+                            n_shorts += 1
+                            above_thresh_ticks.pop(short_key, None)
+                    else:
+                        logger.info("[DRY] Would SHORT %-12s score=%.3f  @ $%.4f",
+                                    sym, score, price)
 
             # ── 9. Log equity snapshot with BTC benchmark ───────────────────
             btc_price = prices.get("BTCUSDT")

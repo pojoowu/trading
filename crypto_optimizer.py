@@ -298,7 +298,9 @@ OPTIMIZER_TOOLS = [
                     "regime_threshold (e.g. -0.005), regime_size_penalty (e.g. 0.5).\n"
                     "CIRCUIT BREAKER: max_daily_loss_pct (e.g. 0.05).\n"
                     "IC TUNING: ic_blend_15m (e.g. 0.6), ic_blend_5m (e.g. 0.4), "
-                    "ic_floor (min IC for non-zero weight, e.g. 0.02)."
+                    "ic_floor (min IC for non-zero weight, e.g. 0.02).\n"
+                    "SHORTING: short_enabled (bool), short_entry_threshold (e.g. 0.05), "
+                    "short_exit_threshold (e.g. 0.02), max_short_positions (e.g. 3)."
                 )
             },
             "reason": {
