@@ -65,7 +65,11 @@ def load_signal_weights():
     if not os.path.exists(path):
         return {}
     with open(path) as f:
-        return json.load(f)
+        d = json.load(f)
+    # File is {"weights": {...}, "reason": ..., "updated_at": ...}
+    if "weights" in d:
+        return d["weights"]
+    return d
 
 
 @st.cache_data(ttl=15)
