@@ -67,31 +67,37 @@ def run_crypto(dry_run: bool = False):
     from crypto_optimizer import run_crypto_optimizer
 
     logger = logging.getLogger("runner")
-    logger.info("╔══════════════════════════════════════════════╗")
-    logger.info("║   CRYPTO TRADING SYSTEM STARTING             ║")
-    logger.info("║   Mode: %-36s║", "DRY RUN" if dry_run else "PAPER TRADING")
-    logger.info("║   Optimizer every %dh                        ║", OPTIMIZER_INTERVAL_HOURS)
-    logger.info("╚══════════════════════════════════════════════╝")
+    logger.info("=" * 50)
+    logger.info("  CRYPTO TRADING SYSTEM STARTING")
+    logger.info("  Mode: %s", "DRY RUN" if dry_run else "PAPER TRADING")
+    logger.info("  Optimizer every %dh", OPTIMIZER_INTERVAL_HOURS)
+    logger.info("=" * 50)
 
     stop_event = threading.Event()
 
     # ── Optimizer thread ──────────────────────────────────────────────────────
     def optimizer_loop():
-        interval_s = OPTIMIZER_INTERVAL_HOURS * 3600
-        # Wait a bit before first run so trader has time to log some signals
-        initial_wait = min(3600, interval_s)
-        logger.info("Optimizer: first run in %.0f min", initial_wait / 60)
-        time.sleep(initial_wait)
+        interval_s   = OPTIMIZER_INTERVAL_HOURS * 3600
+        initial_wait = min(3600, interval_s)   # first run after 1h
+        logger.info("Optimizer thread started — first run in %.0f min", initial_wait / 60)
+        stop_event.wait(initial_wait)
 
         while not stop_event.is_set():
+            logger.info("=" * 40)
+            logger.info("OPTIMIZER RUN STARTING")
+            logger.info("=" * 40)
             try:
-                logger.info("--- OPTIMIZER STARTING ---")
-                result = run_crypto_optimizer(dry_run=dry_run)
-                n_resolved = result.get("n_resolved", 0) if isinstance(result, dict) else 0
-                reason     = result.get("reason", "") if isinstance(result, dict) else ""
-                logger.info("--- OPTIMIZER DONE | resolved=%s | %s ---", n_resolved, reason[:80])
+                result     = run_crypto_optimizer(dry_run=dry_run)
+                skipped    = result.get("skipped", False) if isinstance(result, dict) else False
+                n_resolved = result.get("n_resolved", 0)  if isinstance(result, dict) else 0
+                reason     = result.get("reason", "")     if isinstance(result, dict) else str(result)
+                if skipped:
+                    logger.warning("OPTIMIZER SKIPPED: %s", reason)
+                else:
+                    logger.info("OPTIMIZER DONE | resolved=%d | %s", n_resolved, reason[:120])
             except Exception as exc:
-                logger.exception("Optimizer error: %s", exc)
+                logger.exception("OPTIMIZER FAILED: %s", exc)
+            logger.info("Next optimizer run in %dh", OPTIMIZER_INTERVAL_HOURS)
             stop_event.wait(interval_s)
 
     opt_thread = threading.Thread(target=optimizer_loop, daemon=True, name="optimizer")
