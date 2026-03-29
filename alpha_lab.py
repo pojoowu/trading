@@ -283,6 +283,30 @@ ALL_SIGNALS: dict[str, callable] = {
     "support_proximity": sig_support_proximity,
 }
 
+# Load any signals discovered by the optimizer at runtime
+def _load_learned_signals():
+    path = "data/learned_signals.py"
+    try:
+        import importlib.util, os
+        if not os.path.exists(path):
+            return
+        spec = importlib.util.spec_from_file_location("learned_signals", path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        added = 0
+        for attr in dir(mod):
+            if attr.startswith("sig_") and callable(getattr(mod, attr)):
+                name = attr[4:]   # strip "sig_" prefix
+                if name not in ALL_SIGNALS:
+                    ALL_SIGNALS[name] = getattr(mod, attr)
+                    added += 1
+        if added:
+            logger.info("Loaded %d learned signal(s) from %s", added, path)
+    except Exception as exc:
+        logger.warning("Could not load learned signals: %s", exc)
+
+_load_learned_signals()
+
 # Momentum-biased defaults: crypto trends strongly, so weight momentum/breakout
 # higher out of the box. The optimizer will refine these after ~1h of data.
 DEFAULT_WEIGHTS = {

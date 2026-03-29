@@ -129,6 +129,13 @@ def run_optimizer_once(dry_run: bool = False):
         print(f"Portfolio stats  : {result.get('eq_stats', {})}")
         if result.get("commentary"):
             print(f"\nClaude commentary:\n{result['commentary']}")
+        proposed = result.get("proposed_signals", [])
+        if proposed:
+            print(f"\nNew signals proposed ({len(proposed)}):")
+            for s in proposed:
+                status = "SAVED" if s.get("saved") else "REJECTED"
+                print(f"  [{status}] {s['name']:<28} IC={s['ic']:+.4f}  p={s['pval']:.4f}  n={s['n']}")
+                print(f"           {s.get('description', '')}")
         print("\nTop signals by new weight:")
         nw = result.get("new_weights", {})
         if isinstance(nw, dict):

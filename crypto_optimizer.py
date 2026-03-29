@@ -28,6 +28,7 @@ import anthropic
 
 from alpha_lab import ALL_SIGNALS, compute_ic, ic_to_weights, DEFAULT_WEIGHTS, rank_symbols
 from crypto_data import batch_history, DEFAULT_UNIVERSE
+from alpha_researcher import param_search, walk_forward_backtest, test_new_signal, save_learned_signal
 
 logger = logging.getLogger(__name__)
 
@@ -205,26 +206,71 @@ def _quick_backtest(
 
 # ── Claude meta-agent ─────────────────────────────────────────────────────────
 
-OPTIMIZER_SYSTEM = """You are a quantitative crypto trading strategy optimizer.
+OPTIMIZER_SYSTEM = """You are a quantitative crypto trading strategy optimizer and alpha researcher.
 
-You receive:
-1. IC table: Spearman correlation of each signal with 15-min forward returns
-2. IC-derived suggested weights (proportional to IC²)
-3. Current weights being used
-4. Backtest results comparing current vs suggested weights
-5. Recent portfolio performance (equity curve stats)
+Each run you receive:
+1. IC table: Spearman correlation of each of the 22 signals with 15-min forward returns
+2. Parameter search results: IC for hundreds of signal variants (different periods/thresholds)
+3. Walk-forward backtest: out-of-sample Sharpe across 3 time folds (more reliable than single window)
+4. Current vs suggested weights comparison
+5. Portfolio performance stats
 
-Your task:
-- Approve or modify the suggested weights
-- Note which signals to boost (high positive IC) and which to zero out (negative/zero IC)
-- Suggest any parameter changes (stop loss, take profit, entry threshold, max positions)
-- Be conservative: don't make extreme changes all at once
-- Explain your reasoning concisely
+YOUR TASKS — do ALL of these each run:
 
-You MUST call update_strategy with your final decisions.
+TASK 1 — Update weights & params:
+Call update_strategy with improved signal weights and any parameter changes.
+Use IC²-proportional weights but override if backtest contradicts IC.
+Be conservative: blend old and new weights (e.g. 70% new + 30% old).
+
+TASK 2 — Propose new alpha signals (1-2 per run):
+Call propose_signal with a new signal idea as Python code.
+Focus on patterns NOT covered by the current 22 signals, such as:
+- BTC dominance proxy: BTC's 15-min momentum predicting altcoin returns (lagged spillover)
+- Candle structure: body-to-range ratio (strong closes = continuation)
+- Intraday time patterns: volume at certain hours tends to be directional
+- Volatility regime: short-term vol vs medium-term vol ratio predicts trend vs mean-reversion
+- Cross-coin relative strength: coin up while BTC flat = coin-specific strength
+Only propose signals with a clear economic/behavioural rationale.
 """
 
-OPTIMIZER_TOOLS = [{
+OPTIMIZER_TOOLS = [
+{
+    "name": "propose_signal",
+    "description": (
+        "Propose a new alpha signal as Python code. It will be tested against "
+        "real bar data and added permanently if IC > 0.05. "
+        "Write signals that exploit crypto-specific patterns not covered by the "
+        "existing 22 signals, e.g.: BTC relative strength vs altcoins, "
+        "intraday volatility expansion, candle body/wick ratios, "
+        "cross-coin momentum spillover, hour-of-day volume anomalies."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "snake_case name, e.g. 'btc_relative_strength'"
+            },
+            "description": {
+                "type": "string",
+                "description": "One sentence: what pattern this captures and why it should predict returns"
+            },
+            "code": {
+                "type": "string",
+                "description": (
+                    "Complete Python function. Must follow this exact template:\n"
+                    "def sig_NAME(df: pd.DataFrame) -> float:\n"
+                    "    # df has columns: Open, High, Low, Close, Volume\n"
+                    "    # return float in [-1.0, +1.0]; +1=strong buy, -1=strong sell\n"
+                    "    ...\n"
+                    "Only numpy (as np) and pandas (as pd) are available."
+                )
+            },
+        },
+        "required": ["name", "description", "code"],
+    },
+},
+{
     "name": "update_strategy",
     "description": "Save updated signal weights and trader parameters.",
     "input_schema": {
@@ -262,7 +308,8 @@ OPTIMIZER_TOOLS = [{
         },
         "required": ["signal_weights", "reason"],
     },
-}]
+}
+]
 
 
 def run_crypto_optimizer(dry_run: bool = False) -> dict:
@@ -306,12 +353,25 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
 
     suggested_weights = ic_to_weights(blended_ic, floor=ic_floor)
 
-    # ── 2. Quick backtest: current vs suggested weights ───────────────────────
-    logger.info("Fetching bars for backtest…")
-    bars = batch_history(DEFAULT_UNIVERSE[:10], interval="1m", days=1)
+    # ── 2. Fetch bars (used for backtest + param search + alpha research) ────
+    logger.info("Fetching bars for backtest and research...")
+    bars = batch_history(DEFAULT_UNIVERSE[:10], interval="1m", days=2)
 
-    bt_current   = _quick_backtest(bars, current_weights,   current_params) if bars else {}
-    bt_suggested = _quick_backtest(bars, suggested_weights, current_params) if bars else {}
+    # ── 3. Walk-forward backtest (out-of-sample, 3 folds) ────────────────────
+    logger.info("Running walk-forward backtest...")
+    bt_current   = walk_forward_backtest(bars, current_weights,   current_params) if bars else {}
+    bt_suggested = walk_forward_backtest(bars, suggested_weights, current_params) if bars else {}
+
+    # ── 4. Parameter search ───────────────────────────────────────────────────
+    logger.info("Running parameter search...")
+    param_results = param_search(bars) if bars else {}
+    # Summarise top variants vs current signals
+    top_variants = [(k, v) for k, v in list(param_results.items())[:15]
+                    if abs(v["ic"]) > 0.03 and v["pval"] < 0.1]
+    param_summary = "\n".join(
+        f"  {name:<28} IC={v['ic']:+.4f}  p={v['pval']:.3f}  n={v['n']}"
+        for name, v in top_variants
+    ) or "  (not enough data yet)"
 
     # ── 3. Equity curve stats ─────────────────────────────────────────────────
     equity_log = load_equity_log(200)
@@ -327,25 +387,26 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
             "current_positions": equity_log[-1].get("n_positions", 0),
         }
 
-    # ── 4. Build IC table for Claude ─────────────────────────────────────────
+    # ── 5. Build prompt for Claude ────────────────────────────────────────────
     ic_table = sorted(blended_ic.items(), key=lambda x: abs(x[1]), reverse=True)
     ic_str   = "\n".join(
-        f"  {sig:<22} IC={v:+.4f}  {'✓ predictive' if v > 0.05 else ('✗ inverse' if v < -0.05 else '~ noise')}"
+        f"  {sig:<22} IC={v:+.4f}  {'predictive' if v > 0.05 else ('inverse' if v < -0.05 else 'noise')}"
         for sig, v in ic_table
     )
 
-    # ── 5. Ask Claude ─────────────────────────────────────────────────────────
+    # ── 6. Ask Claude ─────────────────────────────────────────────────────────
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     prompt = (
         f"Crypto optimizer run at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"Resolved signals used: {len(resolved)}\n\n"
         f"IC TABLE (Spearman corr with 15-min forward returns):\n{ic_str}\n\n"
-        f"SUGGESTED WEIGHTS (IC²-proportional):\n"
+        f"PARAMETER SEARCH — top signal variants by IC:\n{param_summary}\n\n"
+        f"SUGGESTED WEIGHTS (IC-proportional):\n"
         f"{json.dumps({k: round(v,4) for k,v in suggested_weights.items()}, indent=2)}\n\n"
         f"CURRENT WEIGHTS:\n"
         f"{json.dumps({k: round(float(v),4) for k,v in current_weights.items()}, indent=2)}\n\n"
-        f"BACKTEST — current weights: {bt_current}\n"
-        f"BACKTEST — suggested weights: {bt_suggested}\n\n"
+        f"WALK-FORWARD BACKTEST — current weights: {bt_current}\n"
+        f"WALK-FORWARD BACKTEST — suggested weights: {bt_suggested}\n\n"
         f"PORTFOLIO STATS: {eq_stats}\n\n"
         f"CURRENT PARAMS:\n"
         f"  Risk:     stop={current_params.get('stop_loss_pct')}, "
@@ -375,16 +436,17 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
         "Review and call update_strategy with your final weights and any param changes."
     )
 
-    messages      = [{"role": "user", "content": prompt}]
-    new_weights   = suggested_weights
-    new_params    = {}
-    reason        = "IC²-proportional reweighting"
-    commentary    = ""
+    messages         = [{"role": "user", "content": prompt}]
+    new_weights      = suggested_weights
+    new_params       = {}
+    reason           = "IC²-proportional reweighting"
+    commentary       = ""
+    proposed_signals = []
 
-    for _ in range(6):
+    for _ in range(8):
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=1024,
+            max_tokens=1500,
             system=OPTIMIZER_SYSTEM,
             tools=OPTIMIZER_TOOLS,
             messages=messages,
@@ -395,22 +457,75 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
         if resp.stop_reason == "end_turn":
             break
         if resp.stop_reason == "tool_use":
+            tool_results = []
+            strategy_updated = False
+
             for block in resp.content:
-                if block.type == "tool_use" and block.name == "update_strategy":
+                if block.type != "tool_use":
+                    continue
+
+                if block.name == "propose_signal":
+                    inp  = block.input
+                    name = inp.get("name", "unknown")
+                    code = inp.get("code", "")
+                    desc = inp.get("description", "")
+                    logger.info("Claude proposed new signal: '%s' — %s", name, desc)
+
+                    if bars:
+                        result = test_new_signal(name, code, bars)
+                        logger.info(
+                            "Signal '%s' test: IC=%.4f  p=%.4f  n=%d  valid=%s",
+                            name, result["ic"], result["pval"], result["n"], result["valid"],
+                        )
+                        if result["valid"] and result["ic"] > 0.05 and result["pval"] < 0.1:
+                            if not dry_run:
+                                save_learned_signal(name, code, result["ic"])
+                            proposed_signals.append({
+                                "name": name, "description": desc,
+                                "ic": result["ic"], "pval": result["pval"],
+                                "n": result["n"], "saved": not dry_run,
+                            })
+                            feedback = (
+                                f"Signal '{name}' accepted: IC={result['ic']:.4f}, "
+                                f"p={result['pval']:.4f}, n={result['n']}. "
+                                f"{'Saved to learned_signals.py' if not dry_run else 'Dry-run: not saved'}."
+                            )
+                        else:
+                            feedback = (
+                                f"Signal '{name}' rejected: IC={result['ic']:.4f}, "
+                                f"p={result['pval']:.4f}, n={result['n']}, "
+                                f"valid={result['valid']}. "
+                                f"Error: {result.get('error', 'IC too low or p-value too high')}."
+                            )
+                    else:
+                        feedback = f"Signal '{name}' could not be tested: no bar data available."
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": feedback,
+                    })
+
+                elif block.name == "update_strategy":
                     inp         = block.input
                     raw_w       = inp.get("signal_weights", {})
                     total_w     = sum(abs(v) for v in raw_w.values())
                     new_weights = {k: round(v/total_w, 6) for k,v in raw_w.items()} if total_w > 0 else suggested_weights
                     new_params  = inp.get("trader_params", {})
                     reason      = inp.get("reason", reason)
+                    strategy_updated = True
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps({"saved": True}),
+                    })
 
             messages.append({"role": "assistant", "content": resp.content})
-            messages.append({"role": "user", "content": [{
-                "type": "tool_result",
-                "tool_use_id": next(b.id for b in resp.content if b.type == "tool_use"),
-                "content": json.dumps({"saved": True}),
-            }]})
-            break
+            if tool_results:
+                messages.append({"role": "user", "content": tool_results})
+            if strategy_updated:
+                break
 
     # ── 6. Save ───────────────────────────────────────────────────────────────
     if not dry_run:
@@ -423,14 +538,16 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
     # ── 7. Log optimizer run ──────────────────────────────────────────────────
     os.makedirs("data", exist_ok=True)
     history_record = {
-        "ts":              datetime.now(timezone.utc).isoformat(),
-        "n_resolved":      len(resolved),
-        "ic_table":        dict(ic_table),
-        "bt_current":      bt_current,
-        "bt_suggested":    bt_suggested,
-        "eq_stats":        eq_stats,
-        "new_weights":     new_weights,
-        "reason":          reason,
+        "ts":               datetime.now(timezone.utc).isoformat(),
+        "n_resolved":       len(resolved),
+        "ic_table":         dict(ic_table),
+        "bt_current":       bt_current,
+        "bt_suggested":     bt_suggested,
+        "eq_stats":         eq_stats,
+        "new_weights":      new_weights,
+        "reason":           reason,
+        "proposed_signals": proposed_signals,
+        "top_variants":     {k: v for k, v in list(param_results.items())[:10]},
     }
     with open(OPT_HISTORY_FILE, "a") as f:
         f.write(json.dumps(history_record) + "\n")
@@ -440,11 +557,13 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
                 sorted(new_weights.items(), key=lambda x: -x[1])[:3])
 
     return {
-        "new_weights":   new_weights,
-        "ic_table":      dict(ic_table),
-        "bt_current":    bt_current,
-        "bt_suggested":  bt_suggested,
-        "eq_stats":      eq_stats,
-        "reason":        reason,
-        "commentary":    commentary.strip(),
+        "new_weights":      new_weights,
+        "ic_table":         dict(ic_table),
+        "bt_current":       bt_current,
+        "bt_suggested":     bt_suggested,
+        "eq_stats":         eq_stats,
+        "reason":           reason,
+        "commentary":       commentary.strip(),
+        "n_resolved":       len(resolved),
+        "proposed_signals": proposed_signals,
     }
