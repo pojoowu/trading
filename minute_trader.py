@@ -112,7 +112,11 @@ def _load_signal_weights() -> Optional[dict]:
     path = "data/signal_weights.json"
     if os.path.exists(path):
         try:
-            return json.load(open(path))
+            d = json.load(open(path))
+            # File is {"weights": {...}, "reason": ..., "updated_at": ...}
+            if "weights" in d:
+                return d["weights"]
+            return d
         except Exception:
             pass
     return None
