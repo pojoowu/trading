@@ -287,6 +287,12 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
     ic_15m = compute_ic(resolved, "fwd_15m")
     ic_5m  = compute_ic(resolved, "fwd_5m")
 
+    # Load current params and weights first (needed for IC blend settings)
+    current_weights = load_weights()
+    if isinstance(current_weights, dict) and "weights" in current_weights:
+        current_weights = current_weights["weights"]
+    current_params = load_trader_params()
+
     # IC horizon blend (weights tunable via params)
     ic_15m_w = current_params.get("ic_blend_15m", 0.6)
     ic_5m_w  = current_params.get("ic_blend_5m",  0.4)
@@ -299,10 +305,6 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
         )
 
     suggested_weights = ic_to_weights(blended_ic, floor=ic_floor)
-    current_weights   = load_weights()
-    if isinstance(current_weights, dict) and "weights" in current_weights:
-        current_weights = current_weights["weights"]
-    current_params    = load_trader_params()
 
     # ── 2. Quick backtest: current vs suggested weights ───────────────────────
     logger.info("Fetching bars for backtest…")
