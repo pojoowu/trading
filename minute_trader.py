@@ -47,7 +47,11 @@ INTRADAY_PARAMS   = "data/intraday_params.json"
 DEFAULT_TRADER_PARAMS = {
     "universe":          DEFAULT_UNIVERSE,
     "max_positions":     5,
-    "position_size_pct": 0.18,       # 18% of equity per position
+    "position_size_pct": 0.18,       # base allocation per position (% of equity)
+    "size_by_score":     True,       # scale size up/down with signal strength
+    "size_by_vol":       True,       # shrink size for high-volatility coins
+    "min_position_pct":  0.05,       # floor: never less than 5% of equity
+    "max_position_pct":  0.25,       # ceiling: never more than 25% of equity
     "entry_threshold":   0.05,       # composite score must exceed this
     "exit_threshold":    -0.08,      # exit if score drops below this
     "stop_loss_pct":     0.015,      # 1.5% hard stop
@@ -158,21 +162,64 @@ class CryptoPortfolio:
 
     def open_position(
         self,
-        symbol: str,
-        price:  float,
-        score:  float,
-        params: dict,
+        symbol:  str,
+        price:   float,
+        score:   float,
+        params:  dict,
+        df:      "Optional[pd.DataFrame]" = None,
     ) -> Optional[CryptoPosition]:
         if symbol in self.positions:
             return None
         if len(self.positions) >= params["max_positions"]:
             return None
 
-        invest = self.equity * params["position_size_pct"]
+        # ── Position sizing ───────────────────────────────────────────────────
+        # Base: flat fraction of current equity (shrinks with losses, grows with gains)
+        base_pct = params["position_size_pct"]
+
+        # 1. Scale by signal strength: strong signal → bigger bet
+        #    score is in [entry_threshold, 1.0]; map linearly to [0.7, 1.3]
+        if params.get("size_by_score", True):
+            entry_thr = params.get("entry_threshold", 0.05)
+            score_factor = 0.7 + 0.6 * min(score / max(entry_thr * 4, 0.20), 1.0)
+        else:
+            score_factor = 1.0
+
+        # 2. Scale by volatility: high ATR → smaller bet (same dollar risk)
+        #    Target risk = stop_loss_pct of invest; adjust so ATR risk is constant
+        vol_factor = 1.0
+        if params.get("size_by_vol", True) and df is not None and len(df) >= 15:
+            try:
+                atr   = float(np.array([
+                    max(h - l, abs(h - pc), abs(l - pc))
+                    for h, l, pc in zip(
+                        df["High"].iloc[-14:],
+                        df["Low"].iloc[-14:],
+                        df["Close"].iloc[-15:-1],
+                    )
+                ]).mean())
+                atr_pct = atr / price if price > 0 else 0.015
+                # Normalise: 1.5% ATR → factor=1.0; higher ATR → smaller size
+                vol_factor = max(0.4, min(1.5, 0.015 / max(atr_pct, 0.001)))
+            except Exception:
+                vol_factor = 1.0
+
+        raw_pct = base_pct * score_factor * vol_factor
+        final_pct = max(
+            params.get("min_position_pct", 0.05),
+            min(params.get("max_position_pct", 0.25), raw_pct),
+        )
+
+        invest = self.equity * final_pct
         if invest > self.cash * 0.99:
             invest = self.cash * 0.99
         if invest < 10:
             return None
+
+        logger.debug(
+            "SIZE  %-12s score=%.3f score_f=%.2f vol_f=%.2f => %.1f%% ($%.0f)",
+            symbol, score, score_factor, vol_factor, final_pct * 100, invest,
+        )
 
         qty   = invest / price
         stop  = price * (1 - params["stop_loss_pct"])
@@ -397,7 +444,7 @@ def run_forever(
                     continue
 
                 if not dry_run:
-                    pos = portfolio.open_position(sym, price, score, params)
+                    pos = portfolio.open_position(sym, price, score, params, df=bars.get(sym))
                     if pos:
                         n_open += 1
                 else:

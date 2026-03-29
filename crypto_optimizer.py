@@ -236,7 +236,13 @@ OPTIMIZER_TOOLS = [{
             },
             "trader_params": {
                 "type": "object",
-                "description": "Optional parameter overrides: stop_loss_pct, take_profit_pct, entry_threshold, max_positions, position_size_pct"
+                "description": (
+                    "Optional parameter overrides. Sizing: position_size_pct (base alloc, e.g. 0.18), "
+                    "min_position_pct (floor, e.g. 0.05), max_position_pct (ceiling, e.g. 0.25), "
+                    "size_by_score (bool), size_by_vol (bool). "
+                    "Risk: stop_loss_pct, take_profit_pct. "
+                    "Entry/exit: entry_threshold, exit_threshold, max_positions."
+                )
             },
             "reason": {
                 "type": "string",
@@ -327,7 +333,10 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
         f"CURRENT PARAMS: stop={current_params.get('stop_loss_pct')}, "
         f"tp={current_params.get('take_profit_pct')}, "
         f"entry_threshold={current_params.get('entry_threshold')}, "
-        f"max_positions={current_params.get('max_positions')}\n\n"
+        f"max_positions={current_params.get('max_positions')}, "
+        f"position_size_pct={current_params.get('position_size_pct')} "
+        f"(base alloc; scaled per-trade by signal strength + volatility, "
+        f"clamped to [{current_params.get('min_position_pct')}, {current_params.get('max_position_pct')}])\n\n"
         "Review and call update_strategy with your final weights and any param changes."
     )
 
