@@ -82,7 +82,9 @@ DEFAULT_TRADER_PARAMS = {
     "ic_blend_15m":        0.6,        # weight of 15-min IC in blended IC
     "ic_blend_5m":         0.4,        # weight of 5-min IC in blended IC
     "ic_floor":            0.02,       # signals below this IC get zero weight
-    # ── Data ──────────────────────────────────────────────────────────────────
+    # ── Realism ───────────────────────────────────────────────────────────────
+    "fee_pct":             0.001,      # 0.1% per trade (Binance taker fee)
+    "slippage_pct":        0.0005,     # 0.05% adverse fill vs close price
     "tick_seconds":        60,         # loop interval
     "min_volume_usdt":     5_000_000,  # skip illiquid coins
     "bar_history_bars":    120,        # bars to fetch per symbol
@@ -250,53 +252,71 @@ class CryptoPortfolio:
             symbol, score, score_factor, vol_factor, regime_factor, final_pct * 100, invest,
         )
 
-        qty   = invest / price
-        stop  = price * (1 - params["stop_loss_pct"])
-        tgt   = price * (1 + params["take_profit_pct"])
+        # Apply slippage (buy at ask = close + slippage) and fee
+        slippage   = params.get("slippage_pct", 0.0005)
+        fee_pct    = params.get("fee_pct", 0.001)
+        fill_price = price * (1 + slippage)          # paid slightly more than close
+        fee        = invest * fee_pct                 # broker commission
+        qty        = (invest - fee) / fill_price      # net shares after fee
+        stop       = fill_price * (1 - params["stop_loss_pct"])
+        tgt        = fill_price * (1 + params["take_profit_pct"])
 
         pos = CryptoPosition(
             symbol=symbol,
-            entry_price=price,
+            entry_price=fill_price,
             qty=qty,
             entry_time=datetime.now(timezone.utc).isoformat(),
             entry_score=score,
             stop_price=stop,
             target_price=tgt,
-            last_price=price,
-            peak_price=price,
+            last_price=fill_price,
+            peak_price=fill_price,
         )
-        self.cash         -= invest
+        self.cash -= invest   # invest includes fee (qty was net of fee)
         self.positions[symbol] = pos
-        _log_trade("BUY", symbol, qty, price, score, invest)
-        logger.info("OPEN  %-12s qty=%.6f  @ $%.4f  score=%.3f", symbol, qty, price, score)
+        _log_trade("BUY", symbol, qty, fill_price, score, invest, fee=fee)
+        logger.info(
+            "OPEN  %-12s qty=%.6f  @ $%.4f  (slip+fee=$%.2f)  score=%.3f",
+            symbol, qty, fill_price, fee + invest * slippage, score,
+        )
         return pos
 
-    def close_position(self, symbol: str, price: float, reason: str):
+    def close_position(self, symbol: str, price: float, reason: str,
+                       params: Optional[dict] = None):
         pos = self.positions.pop(symbol, None)
         if not pos:
             return
-        proceeds     = pos.qty * price
-        pnl          = proceeds - pos.cost_basis
-        pnl_pct      = pos.unrealised_pnl_pct
-        self.cash   += proceeds
-        _log_trade("SELL", symbol, pos.qty, price, pos.entry_score,
-                   proceeds, pnl=pnl, pnl_pct=pnl_pct, reason=reason)
+        # Apply slippage (sell at bid = close - slippage) and fee
+        slippage   = (params or {}).get("slippage_pct", 0.0005)
+        fee_pct    = (params or {}).get("fee_pct", 0.001)
+        fill_price = price * (1 - slippage)
+        gross      = pos.qty * fill_price
+        fee        = gross * fee_pct
+        proceeds   = gross - fee
+        pnl        = proceeds - pos.cost_basis
+        pnl_pct    = (fill_price / pos.entry_price - 1) * 100 if pos.entry_price else 0
+        self.cash += proceeds
+        _log_trade("SELL", symbol, pos.qty, fill_price, pos.entry_score,
+                   proceeds, pnl=pnl, pnl_pct=pnl_pct, reason=reason, fee=fee)
         logger.info(
             "CLOSE %-12s @ $%.4f  pnl=%+.2f%%  reason=%s  hold=%.0fmin",
-            symbol, price, pnl_pct, reason, pos.hold_minutes,
+            symbol, fill_price, pnl_pct, reason, pos.hold_minutes,
         )
 
 
 # ── Logging helpers ───────────────────────────────────────────────────────────
 
-def _log_trade(action, symbol, qty, price, score, value, pnl=None, pnl_pct=None, reason=""):
+def _log_trade(action, symbol, qty, price, score, value,
+               pnl=None, pnl_pct=None, reason="", fee=None):
     os.makedirs("data", exist_ok=True)
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "action": action, "symbol": symbol,
         "qty": qty, "price": price,
         "score": score, "value": value,
-        "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+        "pnl": pnl, "pnl_pct": pnl_pct,
+        "fee": round(fee, 6) if fee else 0.0,
+        "reason": reason,
     }
     with open(TRADE_LOG_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
@@ -319,13 +339,16 @@ def _log_signal(symbol: str, signals: dict, score: float, price: float):
         f.write(json.dumps(record) + "\n")
 
 
-def _log_equity(equity: float, cash: float, n_positions: int):
+def _log_equity(equity: float, cash: float, n_positions: int,
+                btc_price: Optional[float] = None, btc_benchmark: Optional[float] = None):
     os.makedirs("data", exist_ok=True)
     record = {
-        "ts":          datetime.now(timezone.utc).isoformat(),
-        "equity":      round(equity, 4),
-        "cash":        round(cash, 4),
-        "n_positions": n_positions,
+        "ts":            datetime.now(timezone.utc).isoformat(),
+        "equity":        round(equity, 4),
+        "cash":          round(cash, 4),
+        "n_positions":   n_positions,
+        "btc_price":     round(btc_price, 2) if btc_price else None,
+        "btc_benchmark": round(btc_benchmark, 4) if btc_benchmark else None,
     }
     with open(EQUITY_LOG_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
@@ -437,6 +460,7 @@ def run_forever(
     last_exit_times:     dict[str, datetime] = {}   # cooldown tracking
     above_thresh_ticks:  dict[str, int]      = {}   # confirmation-tick counters
     consecutive_losses   = 0                         # circuit breaker counter
+    btc_start_price: Optional[float] = None          # for buy-and-hold benchmark
 
     while True:
         tick_start = time.time()
@@ -492,20 +516,25 @@ def run_forever(
                 partial_tp_pct = params.get("partial_tp_pct", 0.0)
                 if partial_tp_pct > 0 and not pos.partial_tp_done and not dry_run:
                     if price >= pos.entry_price * (1 + partial_tp_pct):
-                        sell_qty  = pos.qty * params.get("partial_tp_size", 0.5)
-                        proceeds  = sell_qty * price
-                        pnl       = proceeds - sell_qty * pos.entry_price
-                        pos.qty  -= sell_qty
+                        slippage   = params.get("slippage_pct", 0.0005)
+                        fee_pct    = params.get("fee_pct", 0.001)
+                        fill_p     = price * (1 - slippage)
+                        sell_qty   = pos.qty * params.get("partial_tp_size", 0.5)
+                        gross      = sell_qty * fill_p
+                        fee        = gross * fee_pct
+                        proceeds   = gross - fee
+                        pnl        = proceeds - sell_qty * pos.entry_price
+                        pos.qty   -= sell_qty
                         portfolio.cash      += proceeds
                         pos.partial_tp_done  = True
                         pos.stop_price       = pos.entry_price   # move stop to breakeven
-                        _log_trade("SELL_PARTIAL", sym, sell_qty, price, pos.entry_score,
+                        _log_trade("SELL_PARTIAL", sym, sell_qty, fill_p, pos.entry_score,
                                    proceeds, pnl=pnl,
-                                   pnl_pct=(price / pos.entry_price - 1) * 100,
-                                   reason="partial_tp")
+                                   pnl_pct=(fill_p / pos.entry_price - 1) * 100,
+                                   reason="partial_tp", fee=fee)
                         logger.info(
                             "PARTIAL_TP %-10s qty=%.6f @ $%.4f  stop->breakeven",
-                            sym, sell_qty, price,
+                            sym, sell_qty, fill_p,
                         )
 
                 # 6b. Full exit conditions (checked in priority order)
@@ -525,7 +554,7 @@ def run_forever(
                     reason = "signal_exit"
 
                 if reason and not dry_run:
-                    portfolio.close_position(sym, price, reason)
+                    portfolio.close_position(sym, price, reason, params=params)
                     last_exit_times[sym] = datetime.now(timezone.utc)
                     if reason in ("stop_loss", "trailing_stop", "signal_exit"):
                         consecutive_losses += 1
@@ -592,8 +621,16 @@ def run_forever(
                 else:
                     logger.info("[DRY] Would BUY %-12s score=%.3f  @ $%.4f", sym, score, price)
 
-            # ── 9. Log equity snapshot ──────────────────────────────────────
-            _log_equity(portfolio.equity, portfolio.cash, len(portfolio.positions))
+            # ── 9. Log equity snapshot with BTC benchmark ───────────────────
+            btc_price = prices.get("BTCUSDT")
+            if btc_price and btc_start_price is None:
+                btc_start_price = btc_price   # anchor on first tick
+            btc_benchmark = None
+            if btc_price and btc_start_price:
+                # What would $initial_cash be worth if we just held BTC?
+                btc_benchmark = initial_cash * (btc_price / btc_start_price)
+            _log_equity(portfolio.equity, portfolio.cash, len(portfolio.positions),
+                        btc_price=btc_price, btc_benchmark=btc_benchmark)
             portfolio.save()
 
             logger.info(

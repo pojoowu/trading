@@ -94,6 +94,26 @@ st.title("📈 Crypto Trading Dashboard")
 now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 st.caption(f"Live paper trading  •  Last loaded: {now_str}  •  Auto-refreshes every 30s")
 
+with st.expander("Simulation assumptions (click to verify accuracy)"):
+    st.markdown("""
+**What is real:**
+- Price data fetched live from **Binance public API** (same candles as live trading)
+- All fills use the **actual Binance close price** of the 1-minute bar
+
+**What is simulated (conservatively):**
+- **Slippage:** buys fill at close + 0.05%, sells fill at close - 0.05% (configurable via `slippage_pct`)
+- **Trading fee:** 0.1% per trade deducted from proceeds (Binance taker rate, configurable via `fee_pct`)
+- **Benchmark:** orange dotted line = what $10k in BTC alone would be worth (buy & hold from session start)
+
+**Known limitations vs live trading:**
+- No order book depth — real large orders move the market more than 0.05%
+- 1-min bar close is used; a real order placed mid-bar would get a different price
+- No funding rates (relevant for perpetual futures, not spot)
+
+**What "Alpha" means:** Strategy return minus BTC benchmark. Positive = beating buy-and-hold.
+    """)
+st.divider()
+
 # ── Portfolio summary ─────────────────────────────────────────────────────────
 
 portfolio = load_portfolio()
@@ -105,19 +125,35 @@ if portfolio:
     positions  = portfolio.get("positions", {})
     updated    = portfolio.get("updated_at", "")[:19].replace("T", " ")
 
-    # Compute total P&L from equity history
+    # Compute total P&L and benchmark comparison
     initial_equity = 10_000.0
     if equity_rows:
         initial_equity = equity_rows[0].get("equity", 10_000.0)
     total_pnl_pct = (equity / initial_equity - 1) * 100 if initial_equity else 0
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total Equity", f"${equity:,.2f}",
+    # BTC buy-and-hold benchmark from equity log
+    btc_bench_pct = None
+    if equity_rows:
+        last_bench = next((r.get("btc_benchmark") for r in reversed(equity_rows)
+                           if r.get("btc_benchmark")), None)
+        if last_bench:
+            btc_bench_pct = (last_bench / initial_equity - 1) * 100
+    alpha = (total_pnl_pct - btc_bench_pct) if btc_bench_pct is not None else None
+
+    # Total fees paid
+    trades_all = load_jsonl("data/crypto_trades.jsonl", 5000)
+    total_fees = sum(t.get("fee", 0) or 0 for t in trades_all)
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1.metric("Total Equity",   f"${equity:,.2f}",
                 delta=f"{total_pnl_pct:+.2f}% from start")
-    col2.metric("Cash", f"${cash:,.2f}")
-    col3.metric("Invested", f"${equity - cash:,.2f}")
-    col4.metric("Open Positions", len(positions))
-    col5.metric("Last Update", updated)
+    col2.metric("BTC Benchmark",
+                f"{btc_bench_pct:+.2f}%" if btc_bench_pct is not None else "N/A",
+                delta=f"Alpha: {alpha:+.2f}%" if alpha is not None else None)
+    col3.metric("Cash",           f"${cash:,.2f}")
+    col4.metric("Invested",       f"${equity - cash:,.2f}")
+    col5.metric("Open Positions", len(positions))
+    col6.metric("Fees Paid",      f"${total_fees:.2f}", delta="real drag")
 else:
     st.warning("No portfolio data yet. Start the trader with: `python daily_runner.py`")
     st.stop()
@@ -143,19 +179,28 @@ with col_left:
         color     = "green" if df_eq["equity"].iloc[-1] >= start_eq else "red"
 
         fig = go.Figure()
+        # Strategy equity
         fig.add_trace(go.Scatter(
             x=df_eq["ts"], y=df_eq["equity"],
-            mode="lines", name="Equity",
+            mode="lines", name="Strategy",
             line=dict(color=color, width=2),
             fill="tozeroy",
             fillcolor=f"rgba({'0,180,0' if color == 'green' else '200,0,0'},0.07)",
         ))
+        # BTC buy-and-hold benchmark
+        if "btc_benchmark" in df_eq.columns and df_eq["btc_benchmark"].notna().any():
+            fig.add_trace(go.Scatter(
+                x=df_eq["ts"], y=df_eq["btc_benchmark"],
+                mode="lines", name="BTC Buy&Hold",
+                line=dict(color="orange", width=1.5, dash="dot"),
+            ))
         fig.update_layout(
             height=300,
             margin=dict(l=0, r=0, t=10, b=0),
             xaxis_title=None,
             yaxis_title="USD",
             hovermode="x unified",
+            legend=dict(orientation="h", y=1.05),
             plot_bgcolor="rgba(0,0,0,0)",
             paper_bgcolor="rgba(0,0,0,0)",
         )
