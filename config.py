@@ -11,8 +11,19 @@ load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
 
-# ── Broker / execution ───────────────────────────────────────────────────────
-# Set BROKER=alpaca to use Alpaca paper trading. Default is "paper" (local sim).
+# ── Mode: "crypto" (default) or "stocks" ─────────────────────────────────────
+TRADING_MODE = os.getenv("TRADING_MODE", "crypto")
+
+# ── Crypto ────────────────────────────────────────────────────────────────────
+# Binance API keys (only needed for live trading; market data is public)
+BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
+BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "")
+CRYPTO_INITIAL_CASH = float(os.getenv("CRYPTO_INITIAL_CASH", "10000"))
+
+# Optimizer schedule: run every N hours
+OPTIMIZER_INTERVAL_HOURS = int(os.getenv("OPTIMIZER_INTERVAL_HOURS", "4"))
+
+# ── Broker / execution (stocks) ───────────────────────────────────────────────
 BROKER = os.getenv("BROKER", "paper")
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
