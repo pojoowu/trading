@@ -237,11 +237,22 @@ OPTIMIZER_TOOLS = [{
             "trader_params": {
                 "type": "object",
                 "description": (
-                    "Optional parameter overrides. Sizing: position_size_pct (base alloc, e.g. 0.18), "
+                    "Optional parameter overrides — any subset of the following:\n"
+                    "SIZING: position_size_pct (base %, e.g. 0.18), "
                     "min_position_pct (floor, e.g. 0.05), max_position_pct (ceiling, e.g. 0.25), "
-                    "size_by_score (bool), size_by_vol (bool). "
-                    "Risk: stop_loss_pct, take_profit_pct. "
-                    "Entry/exit: entry_threshold, exit_threshold, max_positions."
+                    "size_by_score (bool), score_factor_min (e.g. 0.5), score_factor_max (e.g. 1.5), "
+                    "size_by_vol (bool), vol_factor_min (e.g. 0.3), vol_factor_max (e.g. 2.0), "
+                    "vol_target_atr (baseline ATR, e.g. 0.015).\n"
+                    "RISK PER TRADE: stop_loss_pct, take_profit_pct, trailing_stop_pct (0=off), "
+                    "partial_tp_pct (0=off, e.g. 0.015), partial_tp_size (e.g. 0.5).\n"
+                    "ENTRY/EXIT: entry_threshold, exit_threshold, max_positions, "
+                    "confirm_ticks (1=immediate), cooldown_minutes (after loss exit), "
+                    "max_hold_minutes.\n"
+                    "REGIME: regime_filter (bool), regime_ema_bars (e.g. 20), "
+                    "regime_threshold (e.g. -0.005), regime_size_penalty (e.g. 0.5).\n"
+                    "CIRCUIT BREAKER: max_daily_loss_pct (e.g. 0.05).\n"
+                    "IC TUNING: ic_blend_15m (e.g. 0.6), ic_blend_5m (e.g. 0.4), "
+                    "ic_floor (min IC for non-zero weight, e.g. 0.02)."
                 )
             },
             "reason": {
@@ -276,14 +287,18 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
     ic_15m = compute_ic(resolved, "fwd_15m")
     ic_5m  = compute_ic(resolved, "fwd_5m")
 
-    # Blend ICs: 60% 15m, 40% 5m
+    # IC horizon blend (weights tunable via params)
+    ic_15m_w = current_params.get("ic_blend_15m", 0.6)
+    ic_5m_w  = current_params.get("ic_blend_5m",  0.4)
+    ic_floor = current_params.get("ic_floor", 0.02)
+
     blended_ic = {}
     for sig in ALL_SIGNALS:
         blended_ic[sig] = round(
-            0.6 * ic_15m.get(sig, 0) + 0.4 * ic_5m.get(sig, 0), 4
+            ic_15m_w * ic_15m.get(sig, 0) + ic_5m_w * ic_5m.get(sig, 0), 4
         )
 
-    suggested_weights = ic_to_weights(blended_ic, floor=0.02)
+    suggested_weights = ic_to_weights(blended_ic, floor=ic_floor)
     current_weights   = load_weights()
     if isinstance(current_weights, dict) and "weights" in current_weights:
         current_weights = current_weights["weights"]
@@ -330,13 +345,31 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
         f"BACKTEST — current weights: {bt_current}\n"
         f"BACKTEST — suggested weights: {bt_suggested}\n\n"
         f"PORTFOLIO STATS: {eq_stats}\n\n"
-        f"CURRENT PARAMS: stop={current_params.get('stop_loss_pct')}, "
+        f"CURRENT PARAMS:\n"
+        f"  Risk:     stop={current_params.get('stop_loss_pct')}, "
         f"tp={current_params.get('take_profit_pct')}, "
-        f"entry_threshold={current_params.get('entry_threshold')}, "
-        f"max_positions={current_params.get('max_positions')}, "
-        f"position_size_pct={current_params.get('position_size_pct')} "
-        f"(base alloc; scaled per-trade by signal strength + volatility, "
-        f"clamped to [{current_params.get('min_position_pct')}, {current_params.get('max_position_pct')}])\n\n"
+        f"trailing_stop={current_params.get('trailing_stop_pct', 0)}, "
+        f"partial_tp={current_params.get('partial_tp_pct', 0)} "
+        f"(size={current_params.get('partial_tp_size', 0.5)})\n"
+        f"  Entry:    threshold={current_params.get('entry_threshold')}, "
+        f"confirm_ticks={current_params.get('confirm_ticks', 1)}, "
+        f"cooldown_min={current_params.get('cooldown_minutes', 15)}, "
+        f"max_hold_min={current_params.get('max_hold_minutes')}\n"
+        f"  Exit:     threshold={current_params.get('exit_threshold')}\n"
+        f"  Sizing:   base={current_params.get('position_size_pct')}, "
+        f"range=[{current_params.get('min_position_pct')}, {current_params.get('max_position_pct')}], "
+        f"score_f=[{current_params.get('score_factor_min', 0.7)}, {current_params.get('score_factor_max', 1.3)}], "
+        f"vol_f=[{current_params.get('vol_factor_min', 0.4)}, {current_params.get('vol_factor_max', 1.5)}], "
+        f"vol_target_atr={current_params.get('vol_target_atr', 0.015)}\n"
+        f"  Regime:   filter={current_params.get('regime_filter', True)}, "
+        f"ema={current_params.get('regime_ema_bars', 20)}bars, "
+        f"threshold={current_params.get('regime_threshold', -0.005)}, "
+        f"penalty={current_params.get('regime_size_penalty', 0.5)}\n"
+        f"  Safety:   max_daily_loss={current_params.get('max_daily_loss_pct', 0.05)}, "
+        f"max_positions={current_params.get('max_positions')}\n"
+        f"  IC:       blend=15m×{current_params.get('ic_blend_15m', 0.6)}+"
+        f"5m×{current_params.get('ic_blend_5m', 0.4)}, "
+        f"floor={current_params.get('ic_floor', 0.02)}\n\n"
         "Review and call update_strategy with your final weights and any param changes."
     )
 

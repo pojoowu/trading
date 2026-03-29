@@ -45,21 +45,47 @@ INTRADAY_PARAMS   = "data/intraday_params.json"
 # ── Config (overridable via env / intraday_params.json) ───────────────────────
 
 DEFAULT_TRADER_PARAMS = {
-    "universe":          DEFAULT_UNIVERSE,
-    "max_positions":     5,
-    "position_size_pct": 0.18,       # base allocation per position (% of equity)
-    "size_by_score":     True,       # scale size up/down with signal strength
-    "size_by_vol":       True,       # shrink size for high-volatility coins
-    "min_position_pct":  0.05,       # floor: never less than 5% of equity
-    "max_position_pct":  0.25,       # ceiling: never more than 25% of equity
-    "entry_threshold":   0.05,       # composite score must exceed this
-    "exit_threshold":    -0.08,      # exit if score drops below this
-    "stop_loss_pct":     0.015,      # 1.5% hard stop
-    "take_profit_pct":   0.030,      # 3% take profit
-    "max_hold_minutes":  120,        # force-close after 2h
-    "tick_seconds":      60,         # loop interval
-    "min_volume_usdt":   5_000_000,  # skip illiquid coins
-    "bar_history_bars":  120,        # bars to fetch per symbol
+    "universe":            DEFAULT_UNIVERSE,
+    # ── Portfolio ─────────────────────────────────────────────────────────────
+    "max_positions":       5,          # max concurrent open positions
+    # ── Position sizing ───────────────────────────────────────────────────────
+    "position_size_pct":   0.18,       # base allocation per position (% of equity)
+    "size_by_score":       True,       # scale size with signal conviction
+    "size_by_vol":         True,       # shrink size for high-volatility coins
+    "min_position_pct":    0.05,       # floor: never less than 5% of equity
+    "max_position_pct":    0.25,       # ceiling: never more than 25% of equity
+    "score_factor_min":    0.7,        # min size multiplier (weakest signal above threshold)
+    "score_factor_max":    1.3,        # max size multiplier (strongest signal)
+    "vol_factor_min":      0.4,        # min size multiplier (most volatile)
+    "vol_factor_max":      1.5,        # max size multiplier (calmest)
+    "vol_target_atr":      0.015,      # baseline ATR% for vol normalisation (1.5%)
+    # ── Risk per trade ────────────────────────────────────────────────────────
+    "stop_loss_pct":       0.015,      # 1.5% hard stop below entry
+    "take_profit_pct":     0.030,      # 3.0% take profit above entry
+    "trailing_stop_pct":   0.0,        # >0: trail this % below peak (0 = disabled)
+    "partial_tp_pct":      0.0,        # >0: sell partial_tp_size at this gain (0 = disabled)
+    "partial_tp_size":     0.5,        # fraction to sell at partial TP (0.5 = half)
+    # ── Entry / exit signals ──────────────────────────────────────────────────
+    "entry_threshold":     0.05,       # min composite score to open a position
+    "exit_threshold":      -0.08,      # close if score drops below this
+    "confirm_ticks":       1,          # score must exceed threshold for N consecutive ticks
+    "cooldown_minutes":    15,         # don't re-enter same coin for N min after a loss exit
+    "max_hold_minutes":    120,        # force-close after 2h regardless of signal
+    # ── Market regime filter ──────────────────────────────────────────────────
+    "regime_filter":       True,       # scale down sizing when BTC is in a downtrend
+    "regime_ema_bars":     20,         # EMA period for regime detection
+    "regime_threshold":    -0.005,     # if BTC is this % below its EMA → bear regime
+    "regime_size_penalty": 0.5,        # multiply position size by this in bear regime
+    # ── Risk circuit breakers ─────────────────────────────────────────────────
+    "max_daily_loss_pct":  0.05,       # pause new entries if daily equity drops 5%
+    # ── Optimizer IC settings (read by crypto_optimizer) ─────────────────────
+    "ic_blend_15m":        0.6,        # weight of 15-min IC in blended IC
+    "ic_blend_5m":         0.4,        # weight of 5-min IC in blended IC
+    "ic_floor":            0.02,       # signals below this IC get zero weight
+    # ── Data ──────────────────────────────────────────────────────────────────
+    "tick_seconds":        60,         # loop interval
+    "min_volume_usdt":     5_000_000,  # skip illiquid coins
+    "bar_history_bars":    120,        # bars to fetch per symbol
 }
 
 
@@ -68,11 +94,7 @@ def _load_trader_params() -> dict:
     if os.path.exists(INTRADAY_PARAMS):
         try:
             saved = json.load(open(INTRADAY_PARAMS))
-            for k in ("max_positions", "position_size_pct", "entry_threshold",
-                      "exit_threshold", "stop_loss_pct", "take_profit_pct",
-                      "max_hold_minutes", "tick_seconds"):
-                if k in saved:
-                    p[k] = saved[k]
+            p.update(saved)   # load ALL saved keys; optimizer can tune any param
         except Exception:
             pass
     return p
@@ -93,14 +115,16 @@ def _load_signal_weights() -> Optional[dict]:
 
 @dataclass
 class CryptoPosition:
-    symbol:        str
-    entry_price:   float
-    qty:           float           # in base currency (e.g. BTC)
-    entry_time:    str             # ISO string
-    entry_score:   float
-    stop_price:    float
-    target_price:  float
-    last_price:    float = 0.0
+    symbol:          str
+    entry_price:     float
+    qty:             float           # in base currency (e.g. BTC)
+    entry_time:      str             # ISO string
+    entry_score:     float
+    stop_price:      float
+    target_price:    float
+    last_price:      float = 0.0
+    peak_price:      float = 0.0    # highest price seen since entry (trailing stop)
+    partial_tp_done: bool  = False  # True after first partial take-profit fired
 
     @property
     def cost_basis(self) -> float:
@@ -159,14 +183,17 @@ class CryptoPortfolio:
         for sym, pos in self.positions.items():
             if sym in prices:
                 pos.last_price = prices[sym]
+                if prices[sym] > pos.peak_price:
+                    pos.peak_price = prices[sym]
 
     def open_position(
         self,
-        symbol:  str,
-        price:   float,
-        score:   float,
-        params:  dict,
-        df:      "Optional[pd.DataFrame]" = None,
+        symbol:        str,
+        price:         float,
+        score:         float,
+        params:        dict,
+        df:            "Optional[pd.DataFrame]" = None,
+        regime_factor: float = 1.0,
     ) -> Optional[CryptoPosition]:
         if symbol in self.positions:
             return None
@@ -174,23 +201,22 @@ class CryptoPortfolio:
             return None
 
         # ── Position sizing ───────────────────────────────────────────────────
-        # Base: flat fraction of current equity (shrinks with losses, grows with gains)
         base_pct = params["position_size_pct"]
 
-        # 1. Scale by signal strength: strong signal → bigger bet
-        #    score is in [entry_threshold, 1.0]; map linearly to [0.7, 1.3]
+        # 1. Scale by signal conviction
         if params.get("size_by_score", True):
-            entry_thr = params.get("entry_threshold", 0.05)
-            score_factor = 0.7 + 0.6 * min(score / max(entry_thr * 4, 0.20), 1.0)
+            entry_thr  = max(params.get("entry_threshold", 0.05) * 4, 0.20)
+            sf_min     = params.get("score_factor_min", 0.7)
+            sf_max     = params.get("score_factor_max", 1.3)
+            score_factor = sf_min + (sf_max - sf_min) * min(score / entry_thr, 1.0)
         else:
             score_factor = 1.0
 
-        # 2. Scale by volatility: high ATR → smaller bet (same dollar risk)
-        #    Target risk = stop_loss_pct of invest; adjust so ATR risk is constant
+        # 2. Scale by volatility: high ATR → smaller bet to keep dollar-risk constant
         vol_factor = 1.0
         if params.get("size_by_vol", True) and df is not None and len(df) >= 15:
             try:
-                atr   = float(np.array([
+                atr = float(np.array([
                     max(h - l, abs(h - pc), abs(l - pc))
                     for h, l, pc in zip(
                         df["High"].iloc[-14:],
@@ -198,13 +224,16 @@ class CryptoPortfolio:
                         df["Close"].iloc[-15:-1],
                     )
                 ]).mean())
-                atr_pct = atr / price if price > 0 else 0.015
-                # Normalise: 1.5% ATR → factor=1.0; higher ATR → smaller size
-                vol_factor = max(0.4, min(1.5, 0.015 / max(atr_pct, 0.001)))
+                atr_pct    = atr / price if price > 0 else params.get("vol_target_atr", 0.015)
+                vf_min     = params.get("vol_factor_min", 0.4)
+                vf_max     = params.get("vol_factor_max", 1.5)
+                vol_target = params.get("vol_target_atr", 0.015)
+                vol_factor = max(vf_min, min(vf_max, vol_target / max(atr_pct, 0.001)))
             except Exception:
                 vol_factor = 1.0
 
-        raw_pct = base_pct * score_factor * vol_factor
+        # 3. Regime penalty (bear market → reduce size)
+        raw_pct   = base_pct * score_factor * vol_factor * regime_factor
         final_pct = max(
             params.get("min_position_pct", 0.05),
             min(params.get("max_position_pct", 0.25), raw_pct),
@@ -217,8 +246,8 @@ class CryptoPortfolio:
             return None
 
         logger.debug(
-            "SIZE  %-12s score=%.3f score_f=%.2f vol_f=%.2f => %.1f%% ($%.0f)",
-            symbol, score, score_factor, vol_factor, final_pct * 100, invest,
+            "SIZE  %-12s score=%.3f sf=%.2f vf=%.2f rf=%.2f => %.1f%% ($%.0f)",
+            symbol, score, score_factor, vol_factor, regime_factor, final_pct * 100, invest,
         )
 
         qty   = invest / price
@@ -234,6 +263,7 @@ class CryptoPortfolio:
             stop_price=stop,
             target_price=tgt,
             last_price=price,
+            peak_price=price,
         )
         self.cash         -= invest
         self.positions[symbol] = pos
@@ -354,6 +384,34 @@ def fill_forward_returns(bars: dict[str, pd.DataFrame]):
         logger.info("Filled forward returns for %d signal records", updated)
 
 
+# ── Market regime filter ──────────────────────────────────────────────────────
+
+def _compute_regime_factor(bars: dict, params: dict) -> float:
+    """
+    Detect bull/bear regime from BTC trend.
+    Returns 1.0 in a neutral/bull regime, regime_size_penalty in a bear regime.
+
+    Bear = BTC close is more than regime_threshold% below its EMA.
+    E.g. regime_threshold=-0.005: if BTC is 0.5% below its 20-bar EMA → bear.
+    """
+    if not params.get("regime_filter", True):
+        return 1.0
+    btc = bars.get("BTCUSDT")
+    if btc is None or len(btc) < params.get("regime_ema_bars", 20) + 2:
+        return 1.0
+    ema_n   = int(params.get("regime_ema_bars", 20))
+    ema_val = float(btc["Close"].ewm(span=ema_n, adjust=False).mean().iloc[-1])
+    price   = float(btc["Close"].iloc[-1])
+    if ema_val == 0:
+        return 1.0
+    deviation = (price - ema_val) / ema_val
+    threshold = params.get("regime_threshold", -0.005)
+    if deviation < threshold:
+        factor = params.get("regime_size_penalty", 0.5)
+        return float(factor)
+    return 1.0
+
+
 # ── Main trading loop ─────────────────────────────────────────────────────────
 
 def run_forever(
@@ -369,9 +427,16 @@ def run_forever(
     logger.info("24/7 — Ctrl-C to stop")
     logger.info("=" * 60)
 
-    portfolio    = CryptoPortfolio(initial_cash=initial_cash)
-    tick_count   = 0
-    last_fwd_fill = 0    # timestamp of last forward-return fill
+    portfolio      = CryptoPortfolio(initial_cash=initial_cash)
+    tick_count     = 0
+    last_fwd_fill  = 0
+
+    # ── Session-level state ───────────────────────────────────────────────────
+    daily_open_equity    = portfolio.equity         # reset each calendar day
+    last_reset_day       = datetime.now(timezone.utc).date()
+    last_exit_times:     dict[str, datetime] = {}   # cooldown tracking
+    above_thresh_ticks:  dict[str, int]      = {}   # confirmation-tick counters
+    consecutive_losses   = 0                         # circuit breaker counter
 
     while True:
         tick_start = time.time()
@@ -381,6 +446,13 @@ def run_forever(
         universe = params["universe"]
 
         try:
+            # ── 0. Daily reset ──────────────────────────────────────────────
+            today = datetime.now(timezone.utc).date()
+            if today != last_reset_day:
+                daily_open_equity = portfolio.equity
+                last_reset_day    = today
+                logger.info("New day. Daily open equity reset to $%.2f", daily_open_equity)
+
             # ── 1. Fetch latest bars ────────────────────────────────────────
             n_bars = params["bar_history_bars"]
             bars   = batch_history(universe, interval="1m", days=max(1, n_bars // 1440 + 1))
@@ -411,59 +483,132 @@ def run_forever(
                 if price is None:
                     continue
 
-                # Score of current position
                 current_score = next(
                     (s for s2, s, _ in ranked if s2 == sym), 0.0
                 )
 
+                # 6a. Partial take-profit: sell a fraction at partial_tp_pct,
+                #     then slide stop to breakeven so the remainder rides for free
+                partial_tp_pct = params.get("partial_tp_pct", 0.0)
+                if partial_tp_pct > 0 and not pos.partial_tp_done and not dry_run:
+                    if price >= pos.entry_price * (1 + partial_tp_pct):
+                        sell_qty  = pos.qty * params.get("partial_tp_size", 0.5)
+                        proceeds  = sell_qty * price
+                        pnl       = proceeds - sell_qty * pos.entry_price
+                        pos.qty  -= sell_qty
+                        portfolio.cash      += proceeds
+                        pos.partial_tp_done  = True
+                        pos.stop_price       = pos.entry_price   # move stop to breakeven
+                        _log_trade("SELL_PARTIAL", sym, sell_qty, price, pos.entry_score,
+                                   proceeds, pnl=pnl,
+                                   pnl_pct=(price / pos.entry_price - 1) * 100,
+                                   reason="partial_tp")
+                        logger.info(
+                            "PARTIAL_TP %-10s qty=%.6f @ $%.4f  stop->breakeven",
+                            sym, sell_qty, price,
+                        )
+
+                # 6b. Full exit conditions (checked in priority order)
                 reason = None
-                if price <= pos.stop_price:
+                trailing_stop_pct = params.get("trailing_stop_pct", 0.0)
+                if trailing_stop_pct > 0 and pos.peak_price > 0:
+                    trail_level = pos.peak_price * (1 - trailing_stop_pct)
+                    if price <= trail_level:
+                        reason = "trailing_stop"
+                if reason is None and price <= pos.stop_price:
                     reason = "stop_loss"
-                elif price >= pos.target_price:
+                elif reason is None and price >= pos.target_price:
                     reason = "take_profit"
-                elif pos.hold_minutes >= params["max_hold_minutes"]:
+                elif reason is None and pos.hold_minutes >= params["max_hold_minutes"]:
                     reason = "max_hold"
-                elif current_score < params["exit_threshold"]:
+                elif reason is None and current_score < params["exit_threshold"]:
                     reason = "signal_exit"
 
                 if reason and not dry_run:
                     portfolio.close_position(sym, price, reason)
+                    last_exit_times[sym] = datetime.now(timezone.utc)
+                    if reason in ("stop_loss", "trailing_stop", "signal_exit"):
+                        consecutive_losses += 1
+                    else:
+                        consecutive_losses = 0
 
-            # ── 7. Enter new positions ──────────────────────────────────────
-            n_open = len(portfolio.positions)
+            # ── 7. Pre-entry checks ─────────────────────────────────────────
+            # Daily loss circuit breaker
+            daily_pnl_pct = (portfolio.equity / daily_open_equity - 1) if daily_open_equity > 0 else 0
+            can_enter = daily_pnl_pct >= -params.get("max_daily_loss_pct", 0.05)
+            if not can_enter:
+                logger.warning(
+                    "Daily loss limit hit (%.1f%%) — pausing new entries",
+                    daily_pnl_pct * 100,
+                )
+
+            # Market regime
+            regime_factor = _compute_regime_factor(bars, params)
+            if regime_factor < 1.0:
+                logger.info("Bear regime — position size penalty %.0f%%", regime_factor * 100)
+
+            # ── 8. Enter new positions ──────────────────────────────────────
+            n_open        = len(portfolio.positions)
+            confirm_ticks = int(params.get("confirm_ticks", 1))
+            cooldown_m    = params.get("cooldown_minutes", 0)
+
             for sym, score, sigs in ranked:
                 if n_open >= params["max_positions"]:
                     break
                 if sym in portfolio.positions:
                     continue
                 if score < params["entry_threshold"]:
-                    break   # ranked list, so everything below is weaker
+                    # Update counter even for below-threshold to reset it
+                    above_thresh_ticks.pop(sym, None)
+                    break   # list is sorted, all remaining are weaker
+
+                # Confirmation ticks: must be above threshold for N consecutive ticks
+                above_thresh_ticks[sym] = above_thresh_ticks.get(sym, 0) + 1
+                if above_thresh_ticks[sym] < confirm_ticks:
+                    continue
+
+                # Re-entry cooldown after a loss exit
+                if cooldown_m > 0 and sym in last_exit_times:
+                    elapsed_m = (datetime.now(timezone.utc) - last_exit_times[sym]).total_seconds() / 60
+                    if elapsed_m < cooldown_m:
+                        continue
+
+                if not can_enter:
+                    break
 
                 price = prices.get(sym, 0)
                 if price <= 0:
                     continue
 
                 if not dry_run:
-                    pos = portfolio.open_position(sym, price, score, params, df=bars.get(sym))
+                    pos = portfolio.open_position(
+                        sym, price, score, params,
+                        df=bars.get(sym),
+                        regime_factor=regime_factor,
+                    )
                     if pos:
                         n_open += 1
+                        above_thresh_ticks.pop(sym, None)   # reset counter after entry
                 else:
                     logger.info("[DRY] Would BUY %-12s score=%.3f  @ $%.4f", sym, score, price)
 
-            # ── 8. Log equity snapshot ──────────────────────────────────────
+            # ── 9. Log equity snapshot ──────────────────────────────────────
             _log_equity(portfolio.equity, portfolio.cash, len(portfolio.positions))
             portfolio.save()
 
             logger.info(
-                "Tick %d | equity=$%.2f | cash=$%.2f | positions=%d | top: %s",
+                "Tick %d | equity=$%.2f | daily=%.1f%% | regime=%.0f%% | "
+                "positions=%d | cons_loss=%d | top: %s",
                 tick_count,
                 portfolio.equity,
-                portfolio.cash,
+                daily_pnl_pct * 100,
+                regime_factor * 100,
                 len(portfolio.positions),
+                consecutive_losses,
                 ", ".join(f"{s}({sc:+.2f})" for s, sc, _ in ranked[:3]),
             )
 
-            # ── 9. Fill forward returns every 15 min ────────────────────────
+            # ── 10. Fill forward returns every 15 min ───────────────────────
             if time.time() - last_fwd_fill > 900:
                 fill_forward_returns(bars)
                 last_fwd_fill = time.time()
