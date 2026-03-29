@@ -283,7 +283,32 @@ ALL_SIGNALS: dict[str, callable] = {
     "support_proximity": sig_support_proximity,
 }
 
-DEFAULT_WEIGHTS = {s: 1.0 / len(ALL_SIGNALS) for s in ALL_SIGNALS}
+# Momentum-biased defaults: crypto trends strongly, so weight momentum/breakout
+# higher out of the box. The optimizer will refine these after ~1h of data.
+DEFAULT_WEIGHTS = {
+    "momentum_1m":       0.04,
+    "momentum_5m":       0.09,
+    "momentum_15m":      0.11,
+    "momentum_1h":       0.09,
+    "mean_reversion":    0.02,
+    "price_accel":       0.06,
+    "hl_position":       0.03,
+    "volatility_ratio":  0.02,
+    "atr_pct":           0.03,
+    "bb_position":       0.02,
+    "volume_surge":      0.07,
+    "obv_momentum":      0.06,
+    "vwap_deviation":    0.03,
+    "rsi_5":             0.03,
+    "rsi_14":            0.02,
+    "stoch_k":           0.02,
+    "macd_signal":       0.06,
+    "williams_r":        0.02,
+    "ema_cross":         0.07,
+    "breakout_strength": 0.08,
+    "gap_fade":          0.01,
+    "support_proximity": 0.02,
+}
 
 
 # ── Compute all signals for one symbol at latest bar ─────────────────────────

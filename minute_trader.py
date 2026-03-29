@@ -48,8 +48,8 @@ DEFAULT_TRADER_PARAMS = {
     "universe":          DEFAULT_UNIVERSE,
     "max_positions":     5,
     "position_size_pct": 0.18,       # 18% of equity per position
-    "entry_threshold":   0.15,       # composite score must exceed this
-    "exit_threshold":    -0.05,      # exit if score drops below this
+    "entry_threshold":   0.05,       # composite score must exceed this
+    "exit_threshold":    -0.08,      # exit if score drops below this
     "stop_loss_pct":     0.015,      # 1.5% hard stop
     "take_profit_pct":   0.030,      # 3% take profit
     "max_hold_minutes":  120,        # force-close after 2h
