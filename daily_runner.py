@@ -30,12 +30,26 @@ from datetime import datetime, timezone
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+def _fix_windows_encoding() -> None:
+    """Force UTF-8 output on Windows so Unicode log chars don't crash."""
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+        # Also tell the Windows console to use UTF-8
+        os.system("chcp 65001 > nul 2>&1")
+
+
 def _setup_logging(log_dir: str = "logs") -> None:
+    _fix_windows_encoding()
     os.makedirs(log_dir, exist_ok=True)
     date_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     log_file  = os.path.join(log_dir, f"trading_{date_str}.log")
     fmt       = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    handlers  = [logging.StreamHandler(sys.stdout), logging.FileHandler(log_file)]
+    handlers  = [
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(log_file, encoding="utf-8"),
+    ]
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
     for noisy in ("urllib3", "httpx", "httpcore", "anthropic"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

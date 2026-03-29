@@ -1,5 +1,5 @@
 """
-monitor.py — live terminal dashboard for the trading agent.
+monitor.py - live terminal dashboard for the trading agent.
 
 Run any time to see current status:
     python monitor.py            # snapshot and exit
@@ -13,12 +13,23 @@ Run any time to see current status:
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+# ── Windows UTF-8 + ANSI setup ────────────────────────────────────────────────
 
-# ── Colour helpers (work on Windows 10+ with ANSI enabled) ───────────────────
+def _fix_windows_encoding():
+    if sys.platform == "win32":
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        os.system("chcp 65001 > nul 2>&1")   # UTF-8 code page
+        os.system("")                          # enable ANSI escape codes
+
+_fix_windows_encoding()
+
+# ── Colour helpers ────────────────────────────────────────────────────────────
 
 GREEN  = "\033[92m"
 RED    = "\033[91m"
@@ -36,6 +47,14 @@ def _bold(s):   return f"{BOLD}{s}{RESET}"
 def _pnl_color(val):
     if val is None: return "N/A"
     return _green(f"+{val:.2f}%") if val >= 0 else _red(f"{val:.2f}%")
+
+# Safe sparkline chars — pure ASCII fallback if UTF-8 somehow still fails
+_SPARK = " ........::::####"
+
+def _spark_char(v, lo, hi):
+    span = hi - lo or 1
+    idx  = int((v - lo) / span * (len(_SPARK) - 1))
+    return _SPARK[max(0, min(idx, len(_SPARK) - 1))]
 
 
 # ── Load data files ───────────────────────────────────────────────────────────
@@ -95,12 +114,12 @@ def show_portfolio():
     equity    = cash + invested
     updated   = data.get("last_updated", "unknown")[:19].replace("T", " ")
 
-    print(_bold("─" * 68))
+    print(_bold("-" * 68))
     print(_bold(f"  PORTFOLIO SNAPSHOT   (updated {updated} UTC)"))
-    print(_bold("─" * 68))
+    print(_bold("-" * 68))
     print(f"  {'Cash':<20} ${cash:>14,.2f}")
     print(f"  {'Invested':<20} ${invested:>14,.2f}")
-    print(f"  {'Total Equity':<20} ${equity:>14,.2f}  {_bold('←')}")
+    print(f"  {'Total Equity':<20} ${equity:>14,.2f}  {_bold('<--')}")
     print()
 
     if not positions:
@@ -108,7 +127,7 @@ def show_portfolio():
     else:
         print(f"  {'Ticker':<8} {'Shares':>8} {'Avg Cost':>10} "
               f"{'Last Price':>11} {'Value':>12} {'P&L %':>8}")
-        print("  " + "─" * 62)
+        print("  " + "-" * 62)
         for ticker, pos in sorted(positions.items()):
             shares     = pos.get("shares", 0)
             avg_cost   = pos.get("avg_cost", 0)
@@ -119,7 +138,7 @@ def show_portfolio():
             print(f"  {ticker:<8} {shares:>8.2f} {avg_cost:>10.2f} "
                   f"{last_price:>11.2f} {value:>12,.2f} {pnl_str:>16}")
 
-    print(_bold("─" * 68))
+    print(_bold("-" * 68))
 
 
 # ── Equity curve (sparkline) ──────────────────────────────────────────────────
@@ -134,17 +153,13 @@ def show_equity_curve():
     if len(equities) < 2:
         return
 
-    # Simple ASCII sparkline
-    lo, hi = min(equities), max(equities)
-    span    = hi - lo or 1
-    chars   = " ▁▂▃▄▅▆▇█"
-    spark   = "".join(chars[int((v - lo) / span * 8)] for v in equities[-40:])
-
+    lo, hi    = min(equities), max(equities)
+    spark     = "".join(_spark_char(v, lo, hi) for v in equities[-40:])
     total_ret = (equities[-1] / equities[0] - 1) * 100
     color     = _green if total_ret >= 0 else _red
 
     print(_bold("  EQUITY CURVE (last 60 days)"))
-    print(f"  ${equities[0]:,.0f} ▶  {spark}  ▶ ${equities[-1]:,.0f}")
+    print(f"  ${equities[0]:,.0f} >>  {spark}  >> ${equities[-1]:,.0f}")
     print(f"  Period return: {color(f'{total_ret:+.2f}%')}  "
           f"over {len(equities)} trading days")
     print()
@@ -196,7 +211,7 @@ def show_trades(n=15):
     print(_bold(f"  RECENT TRADES (last {len(trades)})"))
     print(f"  {'Date':<12} {'Action':<5} {'Ticker':<8} "
           f"{'Shares':>8} {'Price':>8} {'Value':>10} {'Reason':<18} Status")
-    print("  " + "─" * 76)
+    print("  " + "-" * 76)
     for t in reversed(trades):
         date   = t.get("ts", "")[:10]
         action = t.get("action", "")
@@ -240,7 +255,7 @@ def show_params():
     print("  Signal weights:")
     sw = params.get("signal_weights", {})
     for sig, w in sorted(sw.items(), key=lambda x: -x[1]):
-        bar = "█" * int(w * 40)
+        bar = "#" * int(w * 40)
         print(f"    {sig:<22} {w:.3f}  {_cyan(bar)}")
     print()
 
@@ -268,7 +283,7 @@ def show_report():
         print(_yellow("  No reports found yet. Run the agent first."))
         return
     print(_bold(f"  LATEST REPORT: {name}"))
-    print("─" * 68)
+    print("-" * 68)
     print(content)
 
 
@@ -281,12 +296,12 @@ def show_optimizer_history():
         return
     last = reports[-1]
     print(_bold(f"  LAST OPTIMIZER RUN: {last.name}"))
-    print("─" * 68)
+    print("-" * 68)
     # Print just the first 40 lines
     lines = last.read_text().splitlines()[:40]
     print("\n".join(lines))
     if len(last.read_text().splitlines()) > 40:
-        print("  … (truncated, open file for full report)")
+        print("  ... (truncated, open file for full report)")
 
 
 # ── Main dashboard ────────────────────────────────────────────────────────────
@@ -297,9 +312,9 @@ def dashboard():
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     print()
-    print(_bold(_cyan("╔══════════════════════════════════════════════════════════════════╗")))
-    print(_bold(_cyan(f"║  TRADING AGENT MONITOR   {now:<42}║")))
-    print(_bold(_cyan("╚══════════════════════════════════════════════════════════════════╝")))
+    print(_bold(_cyan("=" * 70)))
+    print(_bold(_cyan(f"  TRADING AGENT MONITOR   {now}")))
+    print(_bold(_cyan("=" * 70)))
     print()
 
     show_portfolio()
@@ -331,12 +346,12 @@ def show_comparison():
         v = r.get("params_version", 1)
         versions.setdefault(v, []).append(r)
 
-    print(_bold("─" * 72))
+    print(_bold("-" * 72))
     print(_bold("  PERFORMANCE BY STRATEGY VERSION  (did the optimizer help?)"))
-    print(_bold("─" * 72))
+    print(_bold("-" * 72))
     print(f"  {'Ver':<5} {'Period':<24} {'Days':<6} {'Return':>8} "
           f"{'CAGR':>7} {'Sharpe':>8} {'MaxDD':>8} {'Reason'}")
-    print("  " + "─" * 70)
+    print("  " + "-" * 70)
 
     prev_equity = None
     for ver in sorted(versions.keys()):
@@ -369,7 +384,7 @@ def show_comparison():
         arrow = ""
         if prev_equity is not None:
             prev_cagr = prev_equity
-            arrow = _green(" ▲ improved") if cagr > prev_cagr else _red(" ▼ declined")
+            arrow = _green(" ^ improved") if cagr > prev_cagr else _red(" v declined")
         prev_equity = cagr
 
         # Get update reason from params history
@@ -378,7 +393,7 @@ def show_comparison():
         if params.get("version") == ver:
             reason = (params.get("update_reason") or "")[:35]
 
-        print(f"  v{ver:<4} {start_date} → {end_date}  {n_days:<6} {ret_str:>16} "
+        print(f"  v{ver:<4} {start_date} ->{end_date}  {n_days:<6} {ret_str:>16} "
               f"{cagr_str:>15} {sh_str:>16} {dd_str:>16}  {_cyan(reason)}{arrow}")
 
     print()
@@ -399,14 +414,14 @@ def show_comparison():
 
     if best_ver:
         print(f"  {_bold('Best version so far:')} v{best_ver}  (Sharpe {best_sharpe:.2f})")
-    print(_bold("─" * 72))
+    print(_bold("-" * 72))
     print()
 
     # Show what changed between versions
     opt_reports = sorted(Path("reports").glob("optimizer_*.txt")) if Path("reports").exists() else []
     if opt_reports:
         print(_bold("  OPTIMIZER CHANGE LOG"))
-        print("  " + "─" * 50)
+        print("  " + "-" * 50)
         for rpt in opt_reports[-5:]:
             lines = rpt.read_text().splitlines()
             date  = rpt.stem.replace("optimizer_", "")
@@ -429,9 +444,9 @@ def show_signals():
     signal_log = _load_jsonl("data/signal_log.jsonl", 1000)
     resolved   = [r for r in signal_log if r.get("forward_return_1m") is not None]
 
-    print(_bold("─" * 65))
+    print(_bold("-" * 65))
     print(_bold("  SIGNAL ACCURACY  (correlation with actual 1-month returns)"))
-    print(_bold("─" * 65))
+    print(_bold("-" * 65))
 
     if len(resolved) < 10:
         print(_yellow(f"  Only {len(resolved)} resolved signals so far."))
@@ -443,7 +458,7 @@ def show_signals():
             print(f"  {len(signal_log)} signals logged, {len(resolved)} resolved so far.")
             earliest = signal_log[0].get("signal_date", "?")
             latest   = signal_log[-1].get("signal_date", "?")
-            print(f"  Date range: {earliest} → {latest}")
+            print(f"  Date range: {earliest} ->{latest}")
         return
 
     import numpy as np
@@ -458,7 +473,7 @@ def show_signals():
     weights = params.get("signal_weights", {})
 
     print(f"  {'Signal':<22} {'Corr':>6}  {'Weight':>7}  {'Bar':<30}  Verdict")
-    print("  " + "─" * 75)
+    print("  " + "-" * 75)
 
     correlations = {}
     for sig in signal_names:
@@ -479,11 +494,11 @@ def show_signals():
     for sig, corr in sorted_sigs:
         weight  = weights.get(sig, 0.0)
         bar_len = int(abs(corr) * 25)
-        bar_chr = "█" if corr >= 0 else "░"
+        bar_chr = "#" if corr >= 0 else "."
         bar     = bar_chr * bar_len
 
         if corr >= 0.15:
-            verdict = _green("predictive ✓")
+            verdict = _green("predictive OK")
             bar_col = _green(bar)
         elif corr >= 0.05:
             verdict = _yellow("weak signal")
@@ -517,7 +532,7 @@ def show_signals():
             _yellow(f"  Optimizer still learning ({aligned}/{total} weights aligned with accuracy)")
         )
         print(msg)
-    print(_bold("─" * 65))
+    print(_bold("-" * 65))
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -565,7 +580,7 @@ def main():
         while True:
             os.system("cls" if os.name == "nt" else "clear")
             dashboard()
-            print(_yellow(f"  Auto-refresh every {args.interval}s — Ctrl+C to stop"))
+            print(_yellow(f"  Auto-refresh every {args.interval}s - Ctrl+C to stop"))
             time.sleep(args.interval)
     else:
         dashboard()
