@@ -145,6 +145,11 @@ def _compute_variants(df: pd.DataFrame) -> dict[str, float]:
             except Exception:
                 pass
 
+    # Sanitize: replace NaN/inf with 0
+    for k in list(results.keys()):
+        v = results[k]
+        if not isinstance(v, (int, float)) or not np.isfinite(v):
+            results[k] = 0.0
     return results
 
 
@@ -176,19 +181,21 @@ def param_search(
         closes = df["Close"].values
         for i in range(60, len(df) - n_fwd):
             slice_df = df.iloc[:i+1].copy()
-            fwd_ret  = closes[i + n_fwd] / closes[i] - 1
             variants = _compute_variants(slice_df)
             if not variants:
                 continue
+            fwd = closes[i + n_fwd] / closes[i] - 1 if i + n_fwd < len(closes) else None
+            if fwd is None:
+                continue
+            forward_ys.append(fwd)
             for name, val in variants.items():
                 signal_xs.setdefault(name, []).append(val)
-            # We need the same length for all, so only append if we got signals
-            if variants:
-                forward_ys.append(fwd_ret)
-                # Pad missing signals with 0
-                for name in signal_xs:
-                    if len(signal_xs[name]) < len(forward_ys):
-                        signal_xs[name].append(0.0)
+            # Pad any variant keys that were missing for this bar
+            all_keys = set(variants.keys())
+            for name in list(signal_xs.keys()):
+                if name not in variants:
+                    signal_xs[name].append(0.0)
+                    all_keys.discard(name)
 
     results = {}
     for name, xs in signal_xs.items():
@@ -254,10 +261,29 @@ def walk_forward_backtest(
                 pos   = open_p[sym]
                 price = prices.get(sym, pos["entry_px"])
                 hold  = i - pos["entry_bar"]
-                if (price <= pos["stop"] or price >= pos["target"]
-                        or hold >= params.get("max_hold_minutes", 120)):
-                    pnl = price / pos["entry_px"] - 1
-                    cash += pos["qty"] * price
+                reason = None
+                min_hold = params.get("min_hold_minutes", 5)
+                if price <= pos["stop"]:
+                    reason = "stop"
+                elif price >= pos["target"]:
+                    reason = "tp"
+                elif hold >= params.get("max_hold_minutes", 120):
+                    reason = "timeout"
+                elif hold >= min_hold:
+                    # Check signal exit — use composite score if available
+                    sym_score = next((s for s2, s, _ in ranked_cache if s2 == sym), None) if "ranked_cache" in dir() else None
+                    if sym_score is not None and sym_score < params.get("exit_threshold", -0.08):
+                        reason = "signal_exit"
+
+                if reason:
+                    slippage   = params.get("slippage_pct", 0.0005)
+                    fee_pct    = params.get("fee_pct", 0.001)
+                    fill_exit  = price * (1 - slippage)
+                    gross      = pos["qty"] * fill_exit
+                    fee_close  = gross * fee_pct
+                    proceeds   = gross - fee_close
+                    pnl        = fill_exit / pos["entry_px"] - 1
+                    cash      += proceeds
                     del open_p[sym]
                     trades.append(pnl)
 
@@ -272,12 +298,16 @@ def walk_forward_backtest(
                         if price <= 0: continue
                         invest = port * params.get("position_size_pct", 0.18)
                         if invest > cash * 0.99: continue
-                        qty = invest / price
-                        cash -= invest
+                        slippage   = params.get("slippage_pct", 0.0005)
+                        fee_pct    = params.get("fee_pct", 0.001)
+                        fill_price = price * (1 + slippage)
+                        fee_open   = invest * fee_pct
+                        qty        = (invest - fee_open) / fill_price
+                        cash      -= invest
                         open_p[sym] = {
-                            "qty": qty, "entry_px": price, "entry_bar": i,
-                            "stop":   price * (1 - params.get("stop_loss_pct", 0.015)),
-                            "target": price * (1 + params.get("take_profit_pct", 0.03)),
+                            "qty": qty, "entry_px": fill_price, "entry_bar": i,
+                            "stop":   fill_price * (1 - params.get("stop_loss_pct", 0.015)),
+                            "target": fill_price * (1 + params.get("take_profit_pct", 0.03)),
                         }
                 except Exception:
                     pass

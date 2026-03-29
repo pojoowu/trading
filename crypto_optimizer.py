@@ -511,8 +511,8 @@ def run_crypto_optimizer(dry_run: bool = False) -> dict:
                 elif block.name == "update_strategy":
                     inp         = block.input
                     raw_w       = inp.get("signal_weights", {})
-                    total_w     = sum(abs(v) for v in raw_w.values())
-                    new_weights = {k: round(v/total_w, 6) for k,v in raw_w.items()} if total_w > 0 else suggested_weights
+                    total_w     = sum(max(0.0, v) for v in raw_w.values())
+                    new_weights = {k: round(max(0.0, v)/total_w, 6) for k,v in raw_w.items()} if total_w > 0 else suggested_weights
                     new_params  = inp.get("trader_params", {})
                     reason      = inp.get("reason", reason)
                     strategy_updated = True

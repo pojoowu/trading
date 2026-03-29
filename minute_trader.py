@@ -32,7 +32,6 @@ from crypto_data import (
     batch_history,
 )
 from alpha_lab import rank_symbols, compute_signals, composite_score, ic_to_weights
-from performance_tracker import load_params
 
 logger = logging.getLogger(__name__)
 
@@ -689,6 +688,12 @@ def run_forever(
                 price = prices.get(sym, 0)
                 if price <= 0:
                     continue
+                # Volume filter: skip illiquid coins
+                df_sym = bars.get(sym)
+                if df_sym is not None and len(df_sym) > 0:
+                    vol_usdt = float(df_sym["Volume"].iloc[-1]) * price
+                    if vol_usdt < params.get("min_volume_usdt", 5_000_000):
+                        continue
 
                 if not dry_run:
                     pos = portfolio.open_position(
@@ -734,6 +739,12 @@ def run_forever(
                     price = prices.get(sym, 0)
                     if price <= 0:
                         continue
+                    # Volume filter: skip illiquid coins
+                    df_sym = bars.get(sym)
+                    if df_sym is not None and len(df_sym) > 0:
+                        vol_usdt = float(df_sym["Volume"].iloc[-1]) * price
+                        if vol_usdt < params.get("min_volume_usdt", 5_000_000):
+                            continue
 
                     if not dry_run:
                         pos = portfolio.open_position(
@@ -749,6 +760,14 @@ def run_forever(
                     else:
                         logger.info("[DRY] Would SHORT %-12s score=%.3f  @ $%.4f",
                                     sym, score, price)
+
+            # Reset confirmation counters for symbols no longer above threshold
+            qualifying_long  = {sym for sym, score, _ in ranked if score >= params["entry_threshold"]}
+            qualifying_short = {f"short_{sym}" for sym, score, _ in ranked
+                                if score <= -params.get("short_entry_threshold", params["entry_threshold"])}
+            for key in list(above_thresh_ticks.keys()):
+                if key not in qualifying_long and key not in qualifying_short:
+                    above_thresh_ticks.pop(key)
 
             # ── 9. Log equity snapshot with BTC benchmark ───────────────────
             btc_price = prices.get("BTCUSDT")
