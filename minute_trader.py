@@ -68,9 +68,10 @@ DEFAULT_TRADER_PARAMS = {
     # ── Entry / exit signals ──────────────────────────────────────────────────
     "entry_threshold":     0.05,       # min composite score to open a position
     "exit_threshold":      -0.08,      # close if score drops below this
-    "confirm_ticks":       1,          # score must exceed threshold for N consecutive ticks
+    "confirm_ticks":       2,          # score must exceed threshold for N consecutive ticks
     "cooldown_minutes":    15,         # don't re-enter same coin for N min after a loss exit
     "max_hold_minutes":    120,        # force-close after 2h regardless of signal
+    "min_hold_minutes":    5,          # don't signal_exit until held at least N minutes
     # ── Market regime filter ──────────────────────────────────────────────────
     "regime_filter":       True,       # scale down sizing when BTC is in a downtrend
     "regime_ema_bars":     20,         # EMA period for regime detection
@@ -617,7 +618,8 @@ def run_forever(
                         reason = "max_hold"
                     elif reason is None and current_score > params.get("short_exit_threshold",
                                                                         params["entry_threshold"]):
-                        reason = "signal_exit"
+                        if pos.hold_minutes >= params.get("min_hold_minutes", 5):
+                            reason = "signal_exit"
                 else:
                     if trailing_stop_pct > 0 and pos.peak_price > 0:
                         if price <= pos.peak_price * (1 - trailing_stop_pct):
@@ -629,7 +631,8 @@ def run_forever(
                     elif reason is None and pos.hold_minutes >= params["max_hold_minutes"]:
                         reason = "max_hold"
                     elif reason is None and current_score < params["exit_threshold"]:
-                        reason = "signal_exit"
+                        if pos.hold_minutes >= params.get("min_hold_minutes", 5):
+                            reason = "signal_exit"
 
                 if reason and not dry_run:
                     portfolio.close_position(sym, price, reason, params=params)
